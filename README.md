@@ -42,7 +42,7 @@ installs as an update over the previous one. Move to GitHub secrets before shari
 1. YOLO11-seg finds every person and gives an exact body outline; a tracker gives each a stable ID.
 2. A new person is blurred immediately, before any classification.
 3. CLIP estimates P(female) every few frames (smoothed per person).
-4. A person is un-blurred only if (a) confirmed family by face match (desktop only for now), or
+4. A person is un-blurred only if (a) confirmed family by face match (desktop and Android), or
    (b) repeatedly and confidently classified as not female. Any uncertainty keeps the blur on.
 5. If the detector briefly loses a blurred person, the last silhouette keeps blurring for ~10 frames.
 6. On Android, if a frame fails to process, the screen shows black instead of the raw camera.
