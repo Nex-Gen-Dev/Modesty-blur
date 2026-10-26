@@ -1,0 +1,8 @@
+numpy>=1.26
+opencv-python>=4.9
+torch>=2.2
+ultralytics>=8.3        # YOLO11-seg + ByteTrack
+open_clip_torch>=2.24   # CLIP zero-shot person classifier
+insightface>=0.7.3      # optional: family whitelist (face recognition)
+onnxruntime>=1.17       # use onnxruntime-gpu on NVIDIA for faster face matching
+pytest>=8.0             # optional: run the tests

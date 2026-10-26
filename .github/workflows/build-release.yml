@@ -1,0 +1,146 @@
+name: build-and-release
+
+# Every push to main builds the Android APK plus Linux, Windows and macOS apps,
+# then publishes them together as a new GitHub Release (v0.1.<run number>).
+# The Android app checks this Releases page for updates.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  VERSION: 0.1.${{ github.run_number }}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy opencv-python-headless
+      - run: python tests/test_core.py
+
+  models:
+    # Exports the ONNX models the Android app bundles.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install export dependencies
+        run: |
+          pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+          pip install ultralytics open_clip_torch onnx onnxruntime numpy opencv-python-headless
+      - name: Export models
+        run: python tools/export_models.py android/app/src/main/assets
+      - run: ls -lh android/app/src/main/assets
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-models
+          path: android/app/src/main/assets
+          retention-days: 3
+
+  android:
+    needs: [test, models]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: android-models
+          path: android/app/src/main/assets
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+      - name: Build signed release APK
+        run: >
+          gradle -p android assembleRelease --no-daemon --stacktrace
+          -PgithubRepo=${{ github.repository }}
+          -PversionCode=${{ github.run_number }}
+      - run: cp android/app/build/outputs/apk/release/app-release.apk modesty-blur-android.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android
+          path: modesty-blur-android.apk
+
+  desktop:
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, name: linux, sep: ":", exe: modesty-blur, cpu_torch: true }
+          - { os: windows-latest, name: windows, sep: ";", exe: modesty-blur.exe, cpu_torch: true }
+          - { os: macos-latest, name: macos, sep: ":", exe: modesty-blur, cpu_torch: false }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          if [ "${{ matrix.cpu_torch }}" = "true" ]; then
+            pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+          else
+            pip install torch torchvision
+          fi
+          pip install ultralytics open_clip_torch opencv-python numpy pyinstaller
+          pip install insightface onnxruntime || echo "insightface unavailable: family whitelist disabled in this build"
+      - name: Download segmentation weights
+        shell: bash
+        run: python -c "from ultralytics import YOLO; YOLO('yolo11n-seg.pt')"
+      - name: Build app with PyInstaller
+        shell: bash
+        run: |
+          EXTRA=""
+          if python -c "import insightface" 2>/dev/null; then
+            EXTRA="--collect-all insightface --collect-all onnxruntime"
+          fi
+          pyinstaller desktop_entry.py --name modesty-blur --onedir --noconfirm \
+            --collect-all ultralytics --collect-all open_clip --collect-submodules modesty_blur \
+            --add-data "yolo11n-seg.pt${{ matrix.sep }}." $EXTRA
+      - name: Smoke test the packaged app (loads every model)
+        shell: bash
+        run: ./dist/modesty-blur/${{ matrix.exe }} selftest
+      - name: Zip
+        shell: bash
+        run: |
+          cd dist
+          python -c "import shutil; shutil.make_archive('../modesty-blur-${{ matrix.name }}', 'zip', '.', 'modesty-blur')"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: modesty-blur-${{ matrix.name }}.zip
+
+  release:
+    needs: [android, desktop]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - run: ls -lh artifacts
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v${VERSION}" artifacts/* \
+            --target "${{ github.sha }}" \
+            --title "v${VERSION}" \
+            --generate-notes
