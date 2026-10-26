@@ -7,13 +7,13 @@ import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
- * Runs the slow models (CLIP, face recognition) on a background thread so the live view never waits
- * for them. Until a result arrives the person simply stays blurred.
+ * Runs the slow models (person classifier, face recognition) on a background thread so the live view
+ * never waits for them. Until a result arrives the person simply stays blurred.
  */
-class Worker(private val clip: ClipClassifier, private val face: FaceEngine?) {
+class Worker(private val scorer: (Bitmap) -> Float, private val face: FaceEngine?) {
     sealed class Result {
         class Cls(val id: Int, val p: Float) : Result()
-        class FaceRes(val id: Int, val status: Int, val name: String, val sim: Float) : Result()
+        class FaceRes(val id: Int, val status: Int, val name: String, val sim: Float, val pFemale: Float) : Result()
         class Fail(val id: Int) : Result()
     }
 
@@ -21,7 +21,7 @@ class Worker(private val clip: ClipClassifier, private val face: FaceEngine?) {
     private val pool = Executors.newSingleThreadExecutor()
     private val pendingCount = AtomicInteger(0)
 
-    @Volatile var lastClipMs = 0L
+    @Volatile var lastClsMs = 0L
     @Volatile var lastFaceMs = 0L
 
     val faceAvailable get() = face != null
@@ -32,8 +32,8 @@ class Worker(private val clip: ClipClassifier, private val face: FaceEngine?) {
         pool.execute {
             try {
                 val t0 = System.nanoTime()
-                val p = clip.predictFemale(crop)
-                lastClipMs = (System.nanoTime() - t0) / 1_000_000
+                val p = scorer(crop)
+                lastClsMs = (System.nanoTime() - t0) / 1_000_000
                 results.add(Result.Cls(id, p))
             } catch (e: Throwable) {
                 Log.e("Worker", "classify failed", e)
@@ -45,7 +45,7 @@ class Worker(private val clip: ClipClassifier, private val face: FaceEngine?) {
         }
     }
 
-    /** Looks for a face in [crop] and compares it with the family gallery. */
+    /** Looks for a face in [crop]: identity vs the family gallery, plus the face-gender reading. */
     fun faceCheck(id: Int, crop: Bitmap, threshold: Float) {
         val fe = face
         if (fe == null) {
@@ -56,16 +56,16 @@ class Worker(private val clip: ClipClassifier, private val face: FaceEngine?) {
         pool.execute {
             try {
                 val t0 = System.nanoTime()
-                val emb = fe.embedLargest(crop, 320, 22f)
+                val info = fe.analyzeLargest(crop, 320, 22f)
                 lastFaceMs = (System.nanoTime() - t0) / 1_000_000
-                if (emb == null) {
-                    results.add(Result.FaceRes(id, 0, "", 0f))
+                if (info == null) {
+                    results.add(Result.FaceRes(id, 0, "", 0f, -1f))
                 } else {
-                    val best = FamilyStore.best(emb)
+                    val best = FamilyStore.best(info.emb)
                     if (best != null && best.second >= threshold) {
-                        results.add(Result.FaceRes(id, 2, best.first, best.second))
+                        results.add(Result.FaceRes(id, 2, best.first, best.second, info.pFemale))
                     } else {
-                        results.add(Result.FaceRes(id, 1, "", best?.second ?: 0f))
+                        results.add(Result.FaceRes(id, 1, "", best?.second ?: 0f, info.pFemale))
                     }
                 }
             } catch (e: Throwable) {

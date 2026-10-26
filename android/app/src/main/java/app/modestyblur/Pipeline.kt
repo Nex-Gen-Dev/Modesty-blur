@@ -10,15 +10,34 @@ import android.util.Log
 import kotlin.math.max
 import kotlin.math.min
 
+/** What the app decided about one person (used by the Test lab). */
+class PersonReport(
+    val id: Int,
+    val blurred: Boolean,
+    val decision: String,
+    val pFemale: Float,
+    val facePFemale: Float,
+    val family: String,
+)
+
+/** One shared pipeline so the camera screen and the Test lab never load the models twice. */
+object PipelineHolder {
+    @Volatile private var p: Pipeline? = null
+
+    @Synchronized
+    fun get(ctx: Context): Pipeline = p ?: Pipeline(ctx.applicationContext).also { p = it }
+}
+
 /**
  * Per frame (fast, on the camera thread): segment -> track -> blur.
- * In the background (slow, never blocks the view): CLIP classification and family face matching.
+ * In the background (never blocks the view): the person classifier and face matching.
  * Fail-closed: anyone not yet cleared by the background models is blurred.
  */
 class Pipeline(private val ctx: Context) {
-    private val clip = ClipClassifier(ctx)
+    private val personCls: PersonClassifier? = PersonClassifier.create(ctx)
+    private val clip: ClipClassifier? = if (personCls == null) ClipClassifier(ctx) else null
     private val face: FaceEngine? = FaceEngine.create(ctx)
-    private val worker = Worker(clip, face)
+    private val worker = Worker({ b -> personCls?.predictFemale(b) ?: clip!!.predictFemale(b) }, face)
     private val tracker = Tracker()
     private val engine = DecisionEngine()
     private val inFlight = HashMap<Int, String>()
@@ -31,9 +50,16 @@ class Pipeline(private val ctx: Context) {
     private var segMs = 0f
     private var blurMs = 0f
     private var totalMs = 0f
+    private var lastActiveIds: List<Int> = emptyList()
+
+    /** The Test lab turns this on so the labels are always drawn. */
+    @Volatile var forceDebug = false
+    @Volatile var lastReport: List<PersonReport> = emptyList()
+        private set
 
     private val holdFrames = 10
     private val strength = 0.14f
+    val classifierName get() = if (personCls != null) "trained model" else "CLIP zero-shot"
 
     private val text = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.WHITE }
     private val shadow = Paint().apply { color = Color.argb(150, 0, 0, 0); style = Paint.Style.FILL }
@@ -41,8 +67,19 @@ class Pipeline(private val ctx: Context) {
 
     init {
         FamilyStore.load(ctx)
+        engine.steadyClassifyMs = if (personCls != null) 500L else 3000L
     }
 
+    @Synchronized
+    fun reset() {
+        tracker.clear()
+        engine.reset()
+        inFlight.clear()
+        lastActiveIds = emptyList()
+        lastReport = emptyList()
+    }
+
+    @Synchronized
     fun process(src: Bitmap): Bitmap {
         return try {
             run(src)
@@ -50,16 +87,42 @@ class Pipeline(private val ctx: Context) {
             // Fail closed: if anything breaks, show nothing from the camera.
             Log.e("Pipeline", "frame failed", e)
             Bitmap.createBitmap(src.width, src.height, Bitmap.Config.ARGB_8888).also {
-                if (Prefs.debug(ctx)) {
-                    Canvas(it).apply {
-                        drawColor(Color.BLACK)
-                        text.textSize = src.width * 0.03f
-                        drawText("error: " + (e.message ?: e.javaClass.simpleName), 20f, 60f, text)
-                    }
-                } else {
-                    Canvas(it).drawColor(Color.BLACK)
+                val c = Canvas(it)
+                c.drawColor(Color.BLACK)
+                if (Prefs.debug(ctx) || forceDebug) {
+                    text.textSize = src.width * 0.03f
+                    c.drawText("error: " + (e.message ?: e.javaClass.simpleName), 20f, 60f, text)
                 }
             }
+        }
+    }
+
+    /**
+     * Test lab: run one still photo until the background models have settled, then return the final
+     * blurred image with the debug labels drawn. [lastReport] holds the per-person decisions.
+     */
+    fun runStill(photo: Bitmap, maxMs: Long = 8000): Bitmap {
+        reset()
+        forceDebug = true
+        try {
+            val start = SystemClock.elapsedRealtime()
+            while (true) {
+                process(photo.copy(Bitmap.Config.ARGB_8888, true))
+                if (settled() || SystemClock.elapsedRealtime() - start > maxMs) break
+                Thread.sleep(25)
+            }
+            return process(photo.copy(Bitmap.Config.ARGB_8888, true))
+        } finally {
+            forceDebug = false
+        }
+    }
+
+    @Synchronized
+    private fun settled(): Boolean {
+        if (frame < 3 || inFlight.isNotEmpty() || worker.pending() > 0) return false
+        return lastActiveIds.all {
+            val s = engine.state(it)
+            s.nObs >= 2 && (!worker.faceAvailable || s.faceChecks >= 1)
         }
     }
 
@@ -75,8 +138,8 @@ class Pipeline(private val ctx: Context) {
         }
         val model = yolo!!
         engine.blurThreshold = Prefs.blurThreshold(ctx)
-        val famThr = Prefs.familyThreshold(ctx)
-        val debug = Prefs.debug(ctx)
+        engine.familyThreshold = Prefs.familyThreshold(ctx)
+        val debug = Prefs.debug(ctx) || forceDebug
 
         val bmp = if (src.isMutable) src else src.copy(Bitmap.Config.ARGB_8888, true)
         val W = bmp.width
@@ -87,11 +150,12 @@ class Pipeline(private val ctx: Context) {
         // 1) segmentation + tracking (the only heavy step on the frame path)
         val t0 = System.nanoTime()
         val dilate = (min(W, H) * 0.012f).toInt().coerceAtLeast(6)
-        val active = tracker.update(model.detect(bmp, 0.30f, dilate))
+        val active = tracker.update(model.detect(bmp, Prefs.detectConf(ctx), dilate))
+        lastActiveIds = active.map { it.id }
         val t1 = System.nanoTime()
 
         // 2) hand at most one job per frame to the background worker (crops come from the clean frame)
-        schedule(bmp, active, now, famThr)
+        schedule(bmp, active, now)
 
         // 3) blur everyone not cleared
         for (t in active) {
@@ -108,6 +172,11 @@ class Pipeline(private val ctx: Context) {
         engine.prune(alive)
         inFlight.keys.retainAll(alive)
         val t2 = System.nanoTime()
+
+        lastReport = active.map { t ->
+            val s = engine.state(t.id)
+            PersonReport(t.id, engine.shouldBlur(t.id), statusLabel(s), s.ema, s.facePFemale, s.familyName)
+        }
 
         frame++
         val total = (t2 - tStart) / 1e6f
@@ -136,31 +205,39 @@ class Pipeline(private val ctx: Context) {
                 }
                 is Worker.Result.FaceRes -> {
                     inFlight.remove(r.id)
-                    if (known(r.id)) engine.updateFamily(r.id, r.status, r.name, r.sim, now)
+                    if (known(r.id)) engine.updateFace(r.id, r.status, r.name, r.sim, r.pFemale, now)
                 }
                 is Worker.Result.Fail -> inFlight.remove(r.id)
             }
         }
     }
 
-    private fun schedule(bmp: Bitmap, active: List<Track>, now: Long, famThr: Float) {
+    /** Pick the single most useful background job for this frame. */
+    private fun schedule(bmp: Bitmap, active: List<Track>, now: Long) {
         if (worker.pending() >= 2) return
+        val useFace = worker.faceAvailable
+        // unresolved people first, newest evidence-poor first
         val order = active.sortedWith(
-            compareBy<Track>({ engine.state(it.id).nObs > 0 }, { engine.state(it.id).lastClsMs })
+            compareBy<Track>({ !engine.shouldBlur(it.id) }, { engine.state(it.id).nObs > 0 }, { engine.state(it.id).lastClsMs })
         )
-        val useFace = worker.faceAvailable && !FamilyStore.isEmpty()
         for (t in order) {
             if (inFlight.containsKey(t.id)) continue
-            if (engine.needsClassification(t.id, now)) {
-                crop(bmp, t.det, 1f)?.let {
-                    inFlight[t.id] = "classifying (CLIP)"
-                    worker.classify(t.id, it)
-                    return
-                }
-            } else if (useFace && engine.needsFamilyCheck(t.id, now)) {
+            val s = engine.state(t.id)
+            val wantFace = useFace && engine.needsFaceCheck(t.id, now)
+            val wantCls = engine.needsClassification(t.id, now)
+            // the very first look at a new person is the quick face pass (identity + face reading)
+            val faceFirst = wantFace && s.faceChecks == 0
+            if (faceFirst || (wantFace && !wantCls)) {
                 crop(bmp, t.det, 0.55f)?.let {          // faces live in the upper part of the person
                     inFlight[t.id] = "face check"
-                    worker.faceCheck(t.id, it, famThr)
+                    worker.faceCheck(t.id, it, engine.familyThreshold)
+                    return
+                }
+            }
+            if (wantCls) {
+                crop(bmp, t.det, 1f)?.let {
+                    inFlight[t.id] = "classifying ($classifierName)"
+                    worker.classify(t.id, it)
                     return
                 }
             }
@@ -181,6 +258,14 @@ class Pipeline(private val ctx: Context) {
 
     // ---- debug overlay ----------------------------------------------------------------------------
 
+    private fun statusLabel(s: DecisionEngine.State): String = when {
+        s.isFamily -> "FAMILY ${s.familyName}"
+        s.cleared -> "CLEAR (not female)"
+        s.nObs == 0 -> "BLUR (not classified yet)"
+        s.ema >= engine.blurThreshold -> "BLUR (female)"
+        else -> "BLUR (unsure)"
+    }
+
     private fun drawDebug(bmp: Bitmap, active: List<Track>, model: YoloSeg) {
         val c = Canvas(bmp)
         val ts = max(bmp.width * 0.024f, 14f)
@@ -189,17 +274,19 @@ class Pipeline(private val ctx: Context) {
 
         for (t in active) {
             val s = engine.state(t.id)
-            val (label, color) = when {
-                s.isFamily -> "FAMILY ${s.familyName}" to Color.CYAN
-                s.cleared -> "CLEAR (not female)" to Color.GREEN
-                s.nObs == 0 -> "BLUR (not classified yet)" to Color.RED
-                s.ema >= engine.blurThreshold -> "BLUR (female)" to Color.RED
-                else -> "BLUR (unsure)" to Color.rgb(255, 160, 0)
+            val color = when {
+                s.isFamily -> Color.CYAN
+                s.cleared -> Color.GREEN
+                s.nObs > 0 && s.ema < engine.blurThreshold -> Color.rgb(255, 160, 0)
+                else -> Color.RED
             }
             val action = inFlight[t.id] ?: "idle"
-            val l1 = "#${t.id} $label"
+            val l1 = "#${t.id} ${statusLabel(s)}"
             val l2 = "pF=%.2f  n=%d  %s".format(s.ema, s.nObs, action)
-            val l3 = if (s.lastSim > 0f || s.familyHits > 0) "face sim=%.2f hits=%d".format(s.lastSim, s.familyHits) else ""
+            val l3 = if (s.faceChecks > 0) {
+                val g = if (s.facePFemale >= 0f) "face F=%.2f".format(s.facePFemale) else "no face"
+                "$g  sim=%.2f  hits=%d".format(s.lastSim, s.familyHits)
+            } else ""
 
             box.color = color
             c.drawRect(t.det.x1, t.det.y1, t.det.x2, t.det.y2, box)
@@ -219,12 +306,12 @@ class Pipeline(private val ctx: Context) {
         val famCount = FamilyStore.list().size
         val panel = listOf(
             "%.1f fps   frame %.0f ms  (segment %.0f, blur %.0f)".format(fps, totalMs, segMs, blurMs),
-            "people %d   background queue %d   clip %d ms   face %d ms".format(
-                active.size, worker.pending(), worker.lastClipMs, worker.lastFaceMs
+            "people %d   queue %d   classify %d ms   face %d ms".format(
+                active.size, worker.pending(), worker.lastClsMs, worker.lastFaceMs
             ),
-            "model ${Presets.names[preset]} ${model.inW}x${model.inH}   frame ${bmpSize(active, bmp)}",
-            "blur if pF>=%.2f   family: %s".format(
-                engine.blurThreshold,
+            "${Presets.names[preset]}  model ${model.inW}x${model.inH}  frame ${bmp.width}x${bmp.height}  classifier: $classifierName",
+            "blur if pF>=%.2f  detect>=%.2f  family: %s".format(
+                engine.blurThreshold, Prefs.detectConf(ctx),
                 if (!worker.faceAvailable) "face models missing" else if (famCount == 0) "nobody enrolled" else "$famCount enrolled"
             ),
         )
@@ -234,6 +321,4 @@ class Pipeline(private val ctx: Context) {
         text.color = Color.WHITE
         for ((i, line) in panel.withIndex()) c.drawText(line, ts * 0.4f, ts * 1.25f * (i + 1), text)
     }
-
-    private fun bmpSize(active: List<Track>, bmp: Bitmap) = "${bmp.width}x${bmp.height}"
 }

@@ -6,6 +6,8 @@ import ai.onnxruntime.OrtSession
 import android.content.Context
 import android.graphics.Bitmap
 import java.nio.FloatBuffer
+import kotlin.math.exp
+import kotlin.math.floor
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
@@ -18,28 +20,40 @@ class Face(
     val area get() = (x2 - x1) * (y2 - y1)
 }
 
+/** Everything one face pass learns: identity embedding, face-gender reading (-1 if unavailable), face width. */
+class FaceInfo(val emb: FloatArray, val pFemale: Float, val faceW: Float)
+
 /**
- * Face detection (SCRFD det_500m) and recognition (MobileFaceNet w600k_mbf), both from the
- * InsightFace "buffalo_s" pack. Embeddings are 512 numbers; two photos of the same person
- * have a cosine similarity of roughly 0.5-0.8, different people stay below about 0.3.
+ * Face detection (SCRFD det_500m), recognition (MobileFaceNet w600k_mbf) and an optional face-gender
+ * reading (genderage), all from the InsightFace "buffalo_s" pack.
+ *
+ * Embeddings are 512 numbers; two photos of the same person score a cosine similarity of roughly
+ * 0.5-0.9, different people stay below about 0.3. The gender reading is NOT trusted to clear anyone:
+ * it was seen to call a woman in a uniform and cap "male" with 100% confidence.
  */
 class FaceEngine private constructor(
     private val env: OrtEnvironment,
     private val det: OrtSession,
     private val rec: OrtSession,
+    private val gen: OrtSession?,
 ) {
     private val detInput = det.inputNames.first()
     private val recInput = rec.inputNames.first()
+    private val genInput = gen?.inputNames?.first()
 
     companion object {
         /** Returns null if the face models are not bundled in this build. */
         fun create(ctx: Context): FaceEngine? = try {
             val env = OrtEnvironment.getEnvironment()
-            val o1 = OrtSession.SessionOptions().apply { setIntraOpNumThreads(2) }
-            val o2 = OrtSession.SessionOptions().apply { setIntraOpNumThreads(2) }
-            val det = env.createSession(ctx.assets.open("det_500m.onnx").use { it.readBytes() }, o1)
-            val rec = env.createSession(ctx.assets.open("w600k_mbf.onnx").use { it.readBytes() }, o2)
-            FaceEngine(env, det, rec)
+            fun opts() = OrtSession.SessionOptions().apply { setIntraOpNumThreads(2) }
+            val det = env.createSession(ctx.assets.open("det_500m.onnx").use { it.readBytes() }, opts())
+            val rec = env.createSession(ctx.assets.open("w600k_mbf.onnx").use { it.readBytes() }, opts())
+            val gen = try {
+                env.createSession(ctx.assets.open("genderage.onnx").use { it.readBytes() }, opts())
+            } catch (e: Exception) {
+                null
+            }
+            FaceEngine(env, det, rec, gen)
         } catch (e: Exception) {
             null
         }
@@ -123,13 +137,30 @@ class FaceEngine private constructor(
         return keep
     }
 
-    /** Align the face to the 112x112 ArcFace template and return its normalized 512-d embedding. */
-    fun embed(bmp: Bitmap, face: Face): FloatArray {
-        val w = bmp.width
-        val h = bmp.height
-        val px = IntArray(w * h)
-        bmp.getPixels(px, 0, w, 0, 0, w, h)
+    /** Bilinear RGB sample (0..255 floats) with a black border, written into [out]. */
+    private fun sampleRgb(px: IntArray, w: Int, h: Int, sx: Float, sy: Float, out: FloatArray) {
+        val x0 = floor(sx.toDouble()).toInt()
+        val y0 = floor(sy.toDouble()).toInt()
+        val fx = sx - x0
+        val fy = sy - y0
+        var r = 0f; var g = 0f; var b = 0f
+        for (dy in 0..1) {
+            for (dx in 0..1) {
+                val xx = x0 + dx
+                val yy = y0 + dy
+                if (xx < 0 || yy < 0 || xx >= w || yy >= h) continue
+                val wgt = (if (dx == 0) 1 - fx else fx) * (if (dy == 0) 1 - fy else fy)
+                val p = px[yy * w + xx]
+                r += ((p shr 16) and 0xFF) * wgt
+                g += ((p shr 8) and 0xFF) * wgt
+                b += (p and 0xFF) * wgt
+            }
+        }
+        out[0] = r; out[1] = g; out[2] = b
+    }
 
+    /** Align the face to the 112x112 ArcFace template and return its normalized 512-d embedding. */
+    private fun embedPx(px: IntArray, w: Int, h: Int, face: Face): FloatArray {
         // least-squares similarity transform (rotation + uniform scale + shift) from landmarks to template
         var msx = 0f; var msy = 0f; var mdx = 0f; var mdy = 0f
         for (i in 0 until 5) {
@@ -155,32 +186,17 @@ class FaceEngine private constructor(
 
         val plane = 112 * 112
         val input = FloatArray(3 * plane)
+        val rgb = FloatArray(3)
         for (v in 0 until 112) {
             for (u in 0 until 112) {
                 // inverse mapping: template pixel (u, v) -> source pixel
                 val sx = (a * (u - tx) + b * (v - ty)) / s2
                 val sy = (-b * (u - tx) + a * (v - ty)) / s2
-                val x0 = Math.floor(sx.toDouble()).toInt()
-                val y0 = Math.floor(sy.toDouble()).toInt()
-                val fx = sx - x0
-                val fy = sy - y0
-                var r = 0f; var g = 0f; var bl = 0f
-                for (dyi in 0..1) {
-                    for (dxi in 0..1) {
-                        val xx = x0 + dxi
-                        val yy = y0 + dyi
-                        if (xx < 0 || yy < 0 || xx >= w || yy >= h) continue
-                        val wgt = (if (dxi == 0) 1 - fx else fx) * (if (dyi == 0) 1 - fy else fy)
-                        val p = px[yy * w + xx]
-                        r += ((p shr 16) and 0xFF) * wgt
-                        g += ((p shr 8) and 0xFF) * wgt
-                        bl += (p and 0xFF) * wgt
-                    }
-                }
+                sampleRgb(px, w, h, sx, sy, rgb)
                 val i = v * 112 + u
-                input[i] = (r - 127.5f) / 127.5f
-                input[plane + i] = (g - 127.5f) / 127.5f
-                input[2 * plane + i] = (bl - 127.5f) / 127.5f
+                input[i] = (rgb[0] - 127.5f) / 127.5f
+                input[plane + i] = (rgb[1] - 127.5f) / 127.5f
+                input[2 * plane + i] = (rgb[2] - 127.5f) / 127.5f
             }
         }
 
@@ -200,10 +216,50 @@ class FaceEngine private constructor(
         return emb
     }
 
-    /** Embedding of the biggest face found, or null if there is no face at least [minFace] px wide. */
-    fun embedLargest(bmp: Bitmap, detSize: Int, minFace: Float): FloatArray? {
-        val face = detect(bmp, detSize).maxByOrNull { it.area } ?: return null
-        if (face.x2 - face.x1 < minFace) return null
-        return embed(bmp, face)
+    /** P(female) from the face, or -1 if the gender model is not bundled. Raw 0-255 RGB, 96x96 crop. */
+    private fun genderPx(px: IntArray, w: Int, h: Int, f: Face): Float {
+        val g = gen ?: return -1f
+        val cx = (f.x1 + f.x2) / 2f
+        val cy = (f.y1 + f.y2) / 2f
+        val sc = 96f / (max(f.x2 - f.x1, f.y2 - f.y1) * 1.5f).coerceAtLeast(1f)
+        val plane = 96 * 96
+        val input = FloatArray(3 * plane)
+        val rgb = FloatArray(3)
+        for (v in 0 until 96) {
+            for (u in 0 until 96) {
+                sampleRgb(px, w, h, (u - 48f) / sc + cx, (v - 48f) / sc + cy, rgb)
+                val i = v * 96 + u
+                input[i] = rgb[0]
+                input[plane + i] = rgb[1]
+                input[2 * plane + i] = rgb[2]
+            }
+        }
+        val tensor = OnnxTensor.createTensor(env, FloatBuffer.wrap(input), longArrayOf(1, 3, 96, 96))
+        val logits = tensor.use { t ->
+            g.run(mapOf(genInput!! to t)).use { res ->
+                val buf = (res.get(0) as OnnxTensor).floatBuffer
+                floatArrayOf(buf.get(0), buf.get(1))      // [female, male]
+            }
+        }
+        val m = max(logits[0], logits[1])
+        val e0 = exp(logits[0] - m)
+        val e1 = exp(logits[1] - m)
+        return e0 / (e0 + e1)
     }
+
+    /** One pass over the biggest face in [bmp]: embedding + face-gender. Null if no face >= [minFace] px wide. */
+    fun analyzeLargest(bmp: Bitmap, detSize: Int, minFace: Float): FaceInfo? {
+        val face = detect(bmp, detSize).maxByOrNull { it.area } ?: return null
+        val fw = face.x2 - face.x1
+        if (fw < minFace) return null
+        val w = bmp.width
+        val h = bmp.height
+        val px = IntArray(w * h)
+        bmp.getPixels(px, 0, w, 0, 0, w, h)
+        return FaceInfo(embedPx(px, w, h, face), genderPx(px, w, h, face), fw)
+    }
+
+    /** Embedding only (used when enrolling). */
+    fun embedLargest(bmp: Bitmap, detSize: Int, minFace: Float): FloatArray? =
+        analyzeLargest(bmp, detSize, minFace)?.emb
 }

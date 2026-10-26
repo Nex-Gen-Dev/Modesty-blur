@@ -21,10 +21,12 @@ out.mkdir(parents=True, exist_ok=True)
 
 
 def export_yolo():
-    """Three input sizes (height, width) for the speed/quality presets; portrait frames."""
+    """Four input sizes (height, width) for the speed/quality presets."""
     from ultralytics import YOLO
 
-    for name, size in [("fast", [256, 192]), ("balanced", [320, 256]), ("quality", [448, 352])]:
+    # sizes are [height, width] in 16:9 portrait proportions (the app shows frames upright)
+    for name, size in [("fast", [320, 192]), ("balanced", [384, 224]),
+                       ("quality", [512, 288]), ("ultra", [640, 352])]:
         p = YOLO("yolo11n-seg.pt").export(format="onnx", imgsz=size, opset=12,
                                           dynamic=False, simplify=False)
         shutil.copy(p, out / f"yolo_{name}.onnx")

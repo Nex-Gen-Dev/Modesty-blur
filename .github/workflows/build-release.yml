@@ -24,6 +24,7 @@ jobs:
           python-version: "3.11"
       - run: pip install numpy opencv-python-headless
       - run: python tests/test_core.py
+      - run: python -m py_compile tools/*.py modesty_blur/*.py
 
   models:
     # Exports the ONNX models the Android app bundles.
@@ -40,6 +41,8 @@ jobs:
           pip install ultralytics open_clip_torch onnx onnxruntime numpy opencv-python-headless
       - name: Export models
         run: python tools/export_models.py android/app/src/main/assets
+      - name: Smoke-test the person-classifier training script
+        run: python tools/train_person_cls.py --smoke
       - run: ls -lh android/app/src/main/assets
       - uses: actions/upload-artifact@v4
         with:
@@ -56,6 +59,14 @@ jobs:
         with:
           name: android-models
           path: android/app/src/main/assets
+      - name: Bundle the trained person classifier if present
+        run: |
+          if [ -f models/person_cls.onnx ] && [ -f models/person_cls.json ]; then
+            cp models/person_cls.onnx models/person_cls.json android/app/src/main/assets/
+            echo "bundled trained person classifier"
+          else
+            echo "no trained classifier committed: the app will use CLIP"
+          fi
       - uses: actions/setup-java@v4
         with:
           distribution: temurin

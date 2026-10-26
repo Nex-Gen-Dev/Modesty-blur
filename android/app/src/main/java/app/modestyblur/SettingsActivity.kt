@@ -76,6 +76,35 @@ class SettingsActivity : AppCompatActivity() {
         root.addView(seek)
         root.addView(note("Lower is safer: more people are blurred, including some men."))
 
+        // ---- detection sensitivity ----
+        root.addView(heading("Person detection"))
+        val detText = TextView(this)
+        detText.text = "Treat something as a person at confidence %.2f".format(Prefs.detectConf(this))
+        val detSeek = SeekBar(this).apply {
+            max = 50                                            // 0.20 .. 0.70
+            progress = ((Prefs.detectConf(this@SettingsActivity) - 0.20f) * 100).toInt()
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(s: SeekBar?, p: Int, fromUser: Boolean) {
+                    val v = 0.20f + p / 100f
+                    Prefs.setDetectConf(this@SettingsActivity, v)
+                    detText.text = "Treat something as a person at confidence %.2f".format(v)
+                }
+                override fun onStartTrackingTouch(s: SeekBar?) {}
+                override fun onStopTrackingTouch(s: SeekBar?) {}
+            })
+        }
+        root.addView(detText)
+        root.addView(detSeek)
+        root.addView(note("Raise it if feet or floor patches get blurred. Lower it if someone partly hidden is missed."))
+
+        // ---- test lab ----
+        root.addView(heading("Test lab"))
+        root.addView(note("Run photos through the same pipeline and see exactly what it decides, with a miss-rate summary."))
+        root.addView(Button(this).apply {
+            text = "Open test lab"
+            setOnClickListener { startActivity(Intent(this@SettingsActivity, TestActivity::class.java)) }
+        })
+
         // ---- family ----
         root.addView(heading("Family faces"))
         familySummary = TextView(this)

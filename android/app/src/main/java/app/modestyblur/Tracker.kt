@@ -12,6 +12,11 @@ class Tracker(private val maxLost: Int = 15, private val minIou: Float = 0.2f) {
     val tracks = ArrayList<Track>()
     private var nextId = 1
 
+    /** Forget everyone (IDs keep counting up so stale background results can never collide). */
+    fun clear() {
+        tracks.clear()
+    }
+
     /** Returns the tracks matched to a detection in this frame. */
     fun update(dets: List<Det>): List<Track> {
         class Match(val iou: Float, val t: Int, val d: Int)

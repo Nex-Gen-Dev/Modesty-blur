@@ -35,7 +35,14 @@ installs as an update over the previous one. Move to GitHub secrets before shari
 - Settings > Family faces: pick photos of each family member. Only the numeric face data stays on the
   phone. A family member is un-blurred only after several consecutive face matches and is re-verified
   every few seconds; an unseen or unrecognized face stays blurred.
-- Settings > Speed and quality: Fast (small model, 640x480), Balanced (default), Quality.
+- Settings > Speed and quality: Fast, Balanced (default), Quality and 1080p. All are 16:9 shown in portrait.
+- Settings > Person detection: confidence needed to count something as a person (raise it if feet or floor
+  patches get blurred).
+- Settings > Test lab: pick photos from the gallery, say whether they show women or men, and get the
+  decisions plus a MISS-rate summary, without anyone walking in front of the camera.
+- Family enrollment accepts photos or a short video of the person turning their head. Each photo is stored
+  four ways (normal, mirrored, tilted each way) and video keeps only samples with a new angle, so the person
+  does not have to look at the camera or smile.
 
 ## How it works (fail-closed)
 
@@ -77,11 +84,53 @@ tools/export_models.py   exports YOLO + CLIP to ONNX for the Android app (run by
 .github/workflows/build-release.yml   build + release on every push
 ```
 
+## Teach it with your own pictures (how to contribute)
+
+Out of the box the app guesses with CLIP (a general model, about half a second per person) and with a
+face-gender model that is only ever allowed to ADD blur. Both are fine for a prototype and both make
+mistakes. The fix is a small model trained on pictures from your world (Jerusalem streets, the clothing
+you actually see, the camera height of the glasses). It runs in a few milliseconds, so decisions become
+near-instant, and it is the only way to get the miss rate close to zero.
+
+**What to collect** (privately, with consent where people are identifiable; never upload or share it)
+- Short videos or photos walking around, filmed at chest or eye height like glasses would.
+- Cover the variety on purpose: women with hats, berets, scarves, wigs, long skirts, long sleeves, from the
+  front, side and back, far away and close, in shade and sun, with strollers, in groups. Men with long coats,
+  black hats, kippot, beards, long hair, backpacks. Girls and boys. Bad angles and partial views are the
+  most valuable pictures.
+- Aim for at least 300 crops per class to start and 1500+ for a solid model. More of the hard cases beats more
+  of the easy ones.
+- For bulk, public pedestrian datasets with gender labels (PA-100K, PETA, RAP) are the usual starting point,
+  but they are research-licensed and mostly not from your setting, so use them to bootstrap, not instead of
+  your own footage.
+
+**The workflow** (on your computer, Python installed)
+```bash
+pip install -r requirements.txt
+python tools/extract_crops.py my_footage/ --out dataset/unlabeled      # 1. cut people out of videos/photos
+python tools/label.py dataset/unlabeled --out dataset                   # 2. sort them: w m g b x (one key each)
+python tools/train_person_cls.py dataset --out models --female-weight 3 # 3. train, see the miss-rate table
+git add models/person_cls.onnx models/person_cls.json && git commit -m "trained classifier" && git push
+```
+The next build bundles the model automatically and the app switches from CLIP to it (the debug overlay shows
+"classifier: trained model"). Re-run steps 2 and 3 whenever the Test lab or the street shows you a miss: add
+those pictures, retrain, push. If you are not comfortable running this yourself, send me the `dataset/` folder
+layout (never the photos through public channels) or a few labeled examples and I will adapt the tooling.
+
+**What "female" means to the model.** There is no single standard feature. A model learns a mix of cues
+(clothing shape, hair, build, posture, accessories) and some people are ambiguous at a distance. That is why
+the app is fail-closed: unsure means blurred, and the threshold you pick trades missed women against
+over-blurred men.
+
 ## Known limits
 
 - Appearance-based classification makes mistakes (distance, angle, clothing, lighting). It is a
   best-effort filter, not a guarantee.
 - "Married woman" cannot be reliably seen, so it is not attempted.
-- Android: new people stay blurred for roughly a second until the background models clear them.
-  Speed depends on the phone; Settings > Speed and quality has Fast / Balanced / Quality presets.
+- Android: with the CLIP fallback a man takes about a second to be cleared; with a trained classifier it takes
+  a few frames. Family members are recognized as soon as their face is clearly visible. Anyone whose face
+  cannot be seen stays blurred until the classifier clears them.
+- The face-gender reading can be badly wrong (it called a woman in a uniform and cap male with 100%
+  confidence), so it is only used to add blur, never to remove it.
+- Speed depends on the phone; try Fast if it feels choppy.
 - Avatar face / lip-sync overlay and the glasses version are later phases.

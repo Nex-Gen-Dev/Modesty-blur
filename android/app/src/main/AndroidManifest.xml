@@ -29,6 +29,11 @@
             android:label="Settings" />
 
         <activity
+            android:name=".TestActivity"
+            android:exported="false"
+            android:label="Test lab" />
+
+        <activity
             android:name=".FamilyActivity"
             android:exported="false"
             android:label="Family faces" />
