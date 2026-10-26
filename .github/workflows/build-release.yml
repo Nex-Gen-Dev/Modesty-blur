@@ -98,7 +98,7 @@ jobs:
           else
             pip install torch torchvision
           fi
-          pip install ultralytics open_clip_torch opencv-python numpy pyinstaller
+          pip install ultralytics open_clip_torch opencv-python numpy pyinstaller lapx
           pip install insightface onnxruntime || echo "insightface unavailable: family whitelist disabled in this build"
       - name: Download segmentation weights
         shell: bash
@@ -115,7 +115,16 @@ jobs:
             --add-data "yolo11n-seg.pt${{ matrix.sep }}." $EXTRA
       - name: Smoke test the packaged app (loads every model)
         shell: bash
-        run: ./dist/modesty-blur/${{ matrix.exe }} selftest
+        run: |
+          set +e
+          OUT=$(./dist/modesty-blur/${{ matrix.exe }} selftest 2>&1)
+          CODE=$?
+          echo "$OUT" | tail -80
+          if [ $CODE -ne 0 ]; then
+            MSG=$(echo "$OUT" | tail -25 | head -c 3000 | tr -d '\r' | sed ':a;N;$!ba;s/%/%25/g;s/\n/%0A/g')
+            echo "::error title=selftest failed::$MSG"
+            exit $CODE
+          fi
       - name: Zip
         shell: bash
         run: |
