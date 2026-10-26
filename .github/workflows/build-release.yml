@@ -111,7 +111,7 @@ jobs:
             EXTRA="--collect-all insightface --collect-all onnxruntime"
           fi
           pyinstaller desktop_entry.py --name modesty-blur --onedir --noconfirm \
-            --collect-all ultralytics --collect-all open_clip --collect-submodules modesty_blur \
+            --collect-all ultralytics --collect-all open_clip --collect-all torchvision --collect-submodules modesty_blur \
             --add-data "yolo11n-seg.pt${{ matrix.sep }}." $EXTRA
       - name: Smoke test the packaged app (loads every model)
         shell: bash
