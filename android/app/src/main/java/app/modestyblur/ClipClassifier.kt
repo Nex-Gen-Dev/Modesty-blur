@@ -23,7 +23,7 @@ class ClipClassifier(ctx: Context) {
     init {
         val bytes = ctx.assets.open("clip_visual.onnx").use { it.readBytes() }
         val opts = OrtSession.SessionOptions()
-        opts.setIntraOpNumThreads(4)
+        opts.setIntraOpNumThreads(2)           // leave the other cores to the per-frame segmentation
         session = env.createSession(bytes, opts)
         inputName = session.inputNames.first()
 

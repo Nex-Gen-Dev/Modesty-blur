@@ -8,6 +8,7 @@
 
     <application
         android:allowBackup="false"
+        android:largeHeap="true"
         android:icon="@android:drawable/ic_menu_camera"
         android:label="Modesty Blur"
         android:theme="@style/AppTheme">
@@ -26,6 +27,11 @@
             android:name=".SettingsActivity"
             android:exported="false"
             android:label="Settings" />
+
+        <activity
+            android:name=".FamilyActivity"
+            android:exported="false"
+            android:label="Family faces" />
 
         <provider
             android:name="androidx.core.content.FileProvider"

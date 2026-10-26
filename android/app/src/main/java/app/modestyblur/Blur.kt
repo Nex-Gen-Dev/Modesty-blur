@@ -1,6 +1,6 @@
 package app.modestyblur
 
-import kotlin.math.floor
+import android.graphics.Bitmap
 import kotlin.math.max
 import kotlin.math.min
 
@@ -8,6 +8,9 @@ import kotlin.math.min
  * Full-silhouette blur using normalized convolution: colors are averaged only from pixels
  * inside the mask, so nothing bleeds in from the background and the result is a smooth,
  * unrecognizable blob in the exact shape of the body.
+ *
+ * Fast path: the work happens on a coarse grid (about 40 cells across the short side of the
+ * person), then the grid is interpolated back up. Cost is roughly one pass over the person's pixels.
  */
 object Blur {
 
@@ -42,52 +45,90 @@ object Blur {
         }
     }
 
-    /** Blur the masked area of [px] (ARGB ints, frame size W x H) in place. */
-    fun blurMasked(px: IntArray, frameW: Int, frameH: Int, m: Mask, strength: Float) {
+    /** Blur the silhouette described by [m] directly on [bmp] (must be mutable). */
+    fun blurRegion(bmp: Bitmap, m: Mask, strength: Float) {
         val w = m.w
         val h = m.h
         if (w <= 0 || h <= 0) return
-        val d = if (min(w, h) > 80) 4 else 1
+        if (m.x0 < 0 || m.y0 < 0 || m.x0 + w > bmp.width || m.y0 + h > bmp.height) return
+        val roi = IntArray(w * h)
+        bmp.getPixels(roi, 0, w, m.x0, m.y0, w, h)
+        blurRoi(roi, w, h, m.data, strength)
+        bmp.setPixels(roi, 0, w, m.x0, m.y0, w, h)
+    }
+
+    /** Blur the masked pixels of [roi] (ARGB ints, w x h) in place. */
+    fun blurRoi(roi: IntArray, w: Int, h: Int, mask: ByteArray, strength: Float) {
+        val d = max(2, min(w, h) / 40)                 // cell size in pixels
         val sw = (w + d - 1) / d
         val sh = (h + d - 1) / d
+        val step = max(1, d / 4)                       // sample a subset of pixels per cell
         val sr = FloatArray(sw * sh)
         val sg = FloatArray(sw * sh)
         val sb = FloatArray(sw * sh)
         val sm = FloatArray(sw * sh)
 
-        for (y in 0 until h) {
-            val fy = m.y0 + y
-            if (fy < 0 || fy >= frameH) continue
-            for (x in 0 until w) {
-                if (m.data[y * w + x].toInt() == 0) continue
-                val fx = m.x0 + x
-                if (fx < 0 || fx >= frameW) continue
-                val p = px[fy * frameW + fx]
-                val i = (y / d) * sw + (x / d)
-                sr[i] += ((p shr 16) and 0xFF).toFloat()
-                sg[i] += ((p shr 8) and 0xFF).toFloat()
-                sb[i] += (p and 0xFF).toFloat()
-                sm[i] += 1f
+        var y = 0
+        while (y < h) {
+            val row = y * w
+            val cellRow = (y / d) * sw
+            var x = 0
+            while (x < w) {
+                if (mask[row + x].toInt() != 0) {
+                    val p = roi[row + x]
+                    val i = cellRow + x / d
+                    sr[i] += ((p shr 16) and 0xFF).toFloat()
+                    sg[i] += ((p shr 8) and 0xFF).toFloat()
+                    sb[i] += (p and 0xFF).toFloat()
+                    sm[i] += 1f
+                }
+                x += step
             }
+            y += step
         }
 
-        val rad = max(2, (strength * min(sw, sh)).toInt())
+        val rad = max(1, (strength * min(sw, sh)).toInt())
         for (a in arrayOf(sr, sg, sb, sm)) boxBlur3(a, sw, sh, rad)
 
-        for (y in 0 until h) {
-            val fy = m.y0 + y
-            if (fy < 0 || fy >= frameH) continue
-            val gy = (y + 0.5f) / d - 0.5f
+        // per-cell mean color of the masked pixels only
+        for (i in sr.indices) {
+            val den = max(sm[i], 1e-3f)
+            sr[i] /= den
+            sg[i] /= den
+            sb[i] /= den
+        }
+
+        val ix0 = IntArray(w)
+        val ix1 = IntArray(w)
+        val fxs = FloatArray(w)
+        for (x in 0 until w) {
+            val g = ((x + 0.5f) / d - 0.5f).coerceIn(0f, (sw - 1).toFloat())
+            val i0 = g.toInt()
+            ix0[x] = i0
+            ix1[x] = min(i0 + 1, sw - 1)
+            fxs[x] = g - i0
+        }
+        for (yy in 0 until h) {
+            val g = ((yy + 0.5f) / d - 0.5f).coerceIn(0f, (sh - 1).toFloat())
+            val j0 = g.toInt()
+            val j1 = min(j0 + 1, sh - 1)
+            val fy = g - j0
+            val r0 = j0 * sw
+            val r1 = j1 * sw
+            val row = yy * w
             for (x in 0 until w) {
-                if (m.data[y * w + x].toInt() == 0) continue
-                val fx = m.x0 + x
-                if (fx < 0 || fx >= frameW) continue
-                val gx = (x + 0.5f) / d - 0.5f
-                val den = max(sample(sm, sw, sh, gx, gy), 1e-3f)
-                val r = (sample(sr, sw, sh, gx, gy) / den).toInt().coerceIn(0, 255)
-                val g = (sample(sg, sw, sh, gx, gy) / den).toInt().coerceIn(0, 255)
-                val b = (sample(sb, sw, sh, gx, gy) / den).toInt().coerceIn(0, 255)
-                px[fy * frameW + fx] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
+                if (mask[row + x].toInt() == 0) continue
+                val a = ix0[x]
+                val b = ix1[x]
+                val tx = fxs[x]
+                val w00 = (1 - tx) * (1 - fy)
+                val w10 = tx * (1 - fy)
+                val w01 = (1 - tx) * fy
+                val w11 = tx * fy
+                val r = (sr[r0 + a] * w00 + sr[r0 + b] * w10 + sr[r1 + a] * w01 + sr[r1 + b] * w11).toInt().coerceIn(0, 255)
+                val g2 = (sg[r0 + a] * w00 + sg[r0 + b] * w10 + sg[r1 + a] * w01 + sg[r1 + b] * w11).toInt().coerceIn(0, 255)
+                val b2 = (sb[r0 + a] * w00 + sb[r0 + b] * w10 + sb[r1 + a] * w01 + sb[r1 + b] * w11).toInt().coerceIn(0, 255)
+                roi[row + x] = (0xFF shl 24) or (r shl 16) or (g2 shl 8) or b2
             }
         }
     }
@@ -126,11 +167,12 @@ object Blur {
         }
     }
 
+    /** Bilinear sample of a float grid (used for mask logits). */
     fun sample(a: FloatArray, w: Int, h: Int, fx: Float, fy: Float): Float {
         val x = fx.coerceIn(0f, (w - 1).toFloat())
         val y = fy.coerceIn(0f, (h - 1).toFloat())
-        val x0 = floor(x).toInt()
-        val y0 = floor(y).toInt()
+        val x0 = x.toInt()
+        val y0 = y.toInt()
         val x1 = min(x0 + 1, w - 1)
         val y1 = min(y0 + 1, h - 1)
         val tx = x - x0

@@ -21,12 +21,39 @@ out.mkdir(parents=True, exist_ok=True)
 
 
 def export_yolo():
+    """Three input sizes (height, width) for the speed/quality presets; portrait frames."""
     from ultralytics import YOLO
 
-    p = YOLO("yolo11n-seg.pt").export(format="onnx", imgsz=640, opset=12,
-                                      dynamic=False, simplify=False)
-    shutil.copy(p, out / "yolo11n-seg.onnx")
-    print("yolo ->", out / "yolo11n-seg.onnx")
+    for name, size in [("fast", [256, 192]), ("balanced", [320, 256]), ("quality", [448, 352])]:
+        p = YOLO("yolo11n-seg.pt").export(format="onnx", imgsz=size, opset=12,
+                                          dynamic=False, simplify=False)
+        shutil.copy(p, out / f"yolo_{name}.onnx")
+        print("yolo", name, size, "->", out / f"yolo_{name}.onnx")
+
+
+def export_face_models():
+    """SCRFD face detector + MobileFaceNet embedder from the InsightFace 'buffalo_s' pack."""
+    import time
+    import urllib.request
+    import zipfile
+
+    url = "https://github.com/deepinsight/insightface/releases/download/v0.7/buffalo_s.zip"
+    tmp = out / "_buffalo_s.zip"
+    for attempt in range(4):
+        try:
+            urllib.request.urlretrieve(url, tmp)
+            break
+        except Exception as e:  # network hiccup in CI
+            print("download failed, retrying:", e)
+            time.sleep(5 * (attempt + 1))
+    else:
+        raise SystemExit("could not download buffalo_s.zip")
+    with zipfile.ZipFile(tmp) as z:
+        for name in ("det_500m.onnx", "w600k_mbf.onnx"):
+            with z.open(name) as src, open(out / name, "wb") as dst:
+                shutil.copyfileobj(src, dst)
+    tmp.unlink()
+    print("face models ->", out)
 
 
 def export_clip():
@@ -78,4 +105,5 @@ def export_clip():
 
 if __name__ == "__main__":
     export_yolo()
+    export_face_models()
     export_clip()

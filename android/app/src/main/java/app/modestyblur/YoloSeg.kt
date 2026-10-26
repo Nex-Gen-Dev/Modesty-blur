@@ -3,6 +3,7 @@ package app.modestyblur
 import ai.onnxruntime.OnnxTensor
 import ai.onnxruntime.OrtEnvironment
 import ai.onnxruntime.OrtSession
+import ai.onnxruntime.TensorInfo
 import android.content.Context
 import android.graphics.Bitmap
 import java.nio.FloatBuffer
@@ -22,41 +23,54 @@ private fun iou(a: Cand, b: Cand): Float {
     return if (ua <= 0f) 0f else inter / ua
 }
 
-/** YOLO11-seg (ONNX) person detector + instance masks. Output layout: [1,116,N] and [1,32,160,160]. */
-class YoloSeg(ctx: Context) {
+/**
+ * YOLO11-seg (ONNX) person detector + instance masks. The model's input size is read from the file,
+ * so the Fast / Balanced / Quality presets are just different exported models.
+ * Output layout: [1, 116, N] (4 box + 80 classes + 32 mask coefficients) and [1, 32, H/4, W/4].
+ */
+class YoloSeg(ctx: Context, asset: String) {
     private val env = OrtEnvironment.getEnvironment()
     private val session: OrtSession
     private val inputName: String
-    private val S = 640
+    val inH: Int
+    val inW: Int
 
     init {
-        val bytes = ctx.assets.open("yolo11n-seg.onnx").use { it.readBytes() }
+        val bytes = ctx.assets.open(asset).use { it.readBytes() }
         val opts = OrtSession.SessionOptions()
         opts.setIntraOpNumThreads(4)
         session = env.createSession(bytes, opts)
         inputName = session.inputNames.first()
+        val shape = (session.inputInfo[inputName]!!.info as TensorInfo).shape   // [1, 3, H, W]
+        inH = shape[2].toInt()
+        inW = shape[3].toInt()
     }
 
-    fun detect(src: Bitmap, conf: Float = 0.30f, dilate: Int = 9): List<Det> {
+    fun close() {
+        try { session.close() } catch (_: Exception) {}
+    }
+
+    fun detect(src: Bitmap, conf: Float, dilate: Int): List<Det> {
         val W = src.width
         val H = src.height
-        val scale = min(S.toFloat() / W, S.toFloat() / H)
-        val nw = (W * scale).roundToInt().coerceAtLeast(1)
-        val nh = (H * scale).roundToInt().coerceAtLeast(1)
-        val padX = (S - nw) / 2
-        val padY = (S - nh) / 2
+        val scale = min(inW.toFloat() / W, inH.toFloat() / H)
+        val nw = (W * scale).roundToInt().coerceIn(1, inW)
+        val nh = (H * scale).roundToInt().coerceIn(1, inH)
+        val padX = (inW - nw) / 2
+        val padY = (inH - nh) / 2
 
         val resized = Bitmap.createScaledBitmap(src, nw, nh, true)
         val rp = IntArray(nw * nh)
         resized.getPixels(rp, 0, nw, 0, 0, nw, nh)
         if (resized !== src) resized.recycle()
 
-        val plane = S * S
+        val plane = inW * inH
         val input = FloatArray(3 * plane) { 114f / 255f }
         for (y in 0 until nh) {
+            val row = (y + padY) * inW + padX
             for (x in 0 until nw) {
                 val p = rp[y * nw + x]
-                val i = (y + padY) * S + (x + padX)
+                val i = row + x
                 input[i] = ((p shr 16) and 0xFF) / 255f
                 input[plane + i] = ((p shr 8) and 0xFF) / 255f
                 input[2 * plane + i] = (p and 0xFF) / 255f
@@ -64,7 +78,7 @@ class YoloSeg(ctx: Context) {
         }
 
         val tensor = OnnxTensor.createTensor(
-            env, FloatBuffer.wrap(input), longArrayOf(1, 3, S.toLong(), S.toLong())
+            env, FloatBuffer.wrap(input), longArrayOf(1, 3, inH.toLong(), inW.toLong())
         )
         return tensor.use { t ->
             session.run(mapOf(inputName to t)).use { res ->
@@ -100,31 +114,32 @@ class YoloSeg(ctx: Context) {
             if (x2 - x1 < 4f || y2 - y1 < 4f) continue
             cands.add(Cand(x1, y1, x2, y2, sc, i))
         }
+        if (cands.isEmpty()) return emptyList()
         cands.sortByDescending { it.score }
         val keep = ArrayList<Cand>()
         for (cd in cands) {
-            if (keep.size >= 10) break
+            if (keep.size >= 8) break
             if (keep.none { iou(it, cd) > 0.5f }) keep.add(cd)
         }
-        if (keep.isEmpty()) return emptyList()
 
         val s1 = o1.info.shape             // [1, nm, ph, pw]
         val ph = s1[2].toInt()
         val pw = s1[3].toInt()
         val b1 = o1.floatBuffer
-        val stride = S.toFloat() / pw
+        val strideX = inW.toFloat() / pw
+        val strideY = inH.toFloat() / ph
 
         return keep.map { cd ->
             Det(
                 cd.x1, cd.y1, cd.x2, cd.y2, cd.score,
-                buildMask(cd, b0, b1, n, nm, ph, pw, stride, W, H, scale, padX, padY, dilate)
+                buildMask(cd, b0, b1, n, nm, ph, pw, strideX, strideY, W, H, scale, padX, padY, dilate)
             )
         }
     }
 
     private fun buildMask(
         cd: Cand, b0: FloatBuffer, b1: FloatBuffer, n: Int, nm: Int, ph: Int, pw: Int,
-        stride: Float, W: Int, H: Int, scale: Float, padX: Int, padY: Int, dilate: Int,
+        strideX: Float, strideY: Float, W: Int, H: Int, scale: Float, padX: Int, padY: Int, dilate: Int,
     ): Mask {
         val x0 = max(floor(cd.x1).toInt() - dilate, 0)
         val y0 = max(floor(cd.y1).toInt() - dilate, 0)
@@ -137,10 +152,10 @@ class YoloSeg(ctx: Context) {
         val coef = FloatArray(nm) { b0.get((84 + it) * n + cd.idx) }
 
         // logits over the part of the prototype grid that covers the box
-        val px0 = (floor((cd.x1 * scale + padX) / stride).toInt() - 1).coerceIn(0, pw - 1)
-        val px1 = (ceil((cd.x2 * scale + padX) / stride).toInt() + 1).coerceIn(0, pw - 1)
-        val py0 = (floor((cd.y1 * scale + padY) / stride).toInt() - 1).coerceIn(0, ph - 1)
-        val py1 = (ceil((cd.y2 * scale + padY) / stride).toInt() + 1).coerceIn(0, ph - 1)
+        val px0 = (floor((cd.x1 * scale + padX) / strideX).toInt() - 1).coerceIn(0, pw - 1)
+        val px1 = (ceil((cd.x2 * scale + padX) / strideX).toInt() + 1).coerceIn(0, pw - 1)
+        val py0 = (floor((cd.y1 * scale + padY) / strideY).toInt() - 1).coerceIn(0, ph - 1)
+        val py1 = (ceil((cd.y2 * scale + padY) / strideY).toInt() + 1).coerceIn(0, ph - 1)
         val lw = px1 - px0 + 1
         val lh = py1 - py0 + 1
         val logit = FloatArray(lw * lh)
@@ -158,11 +173,11 @@ class YoloSeg(ctx: Context) {
         for (y in 0 until h) {
             val oy = y0 + y
             if (oy < cd.y1 || oy > cd.y2) continue
-            val fy = ((oy + 0.5f) * scale + padY) / stride - 0.5f - py0
+            val fy = ((oy + 0.5f) * scale + padY) / strideY - 0.5f - py0
             for (x in 0 until w) {
                 val ox = x0 + x
                 if (ox < cd.x1 || ox > cd.x2) continue
-                val fx = ((ox + 0.5f) * scale + padX) / stride - 0.5f - px0
+                val fx = ((ox + 0.5f) * scale + padX) / strideX - 0.5f - px0
                 // slightly generous threshold (sigmoid ~0.31) so the silhouette errs on the big side
                 if (Blur.sample(logit, lw, lh, fx, fy) > -0.8f) data[y * w + x] = 1
             }

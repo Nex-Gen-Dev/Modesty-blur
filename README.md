@@ -27,6 +27,16 @@ Android asks once for permission to install from this app.
 The APK is signed with a prototype key committed at `android/app/prototype-release.p12`, so every build
 installs as an update over the previous one. Move to GitHub secrets before sharing it widely.
 
+### Android app: clean mode, debug mode, family faces
+- Normal mode is just the blurred camera feed. Two small buttons (flip, settings) appear when you tap the
+  screen and fade after a few seconds. No text.
+- Settings > Debug overlay labels every person with what the app decided (blur / clear / family), the
+  probability, and what it is doing right now (classifying, face check, idle), plus fps and timings.
+- Settings > Family faces: pick photos of each family member. Only the numeric face data stays on the
+  phone. A family member is un-blurred only after several consecutive face matches and is re-verified
+  every few seconds; an unseen or unrecognized face stays blurred.
+- Settings > Speed and quality: Fast (small model, 640x480), Balanced (default), Quality.
+
 ## How it works (fail-closed)
 
 1. YOLO11-seg finds every person and gives an exact body outline; a tracker gives each a stable ID.
@@ -72,6 +82,6 @@ tools/export_models.py   exports YOLO + CLIP to ONNX for the Android app (run by
 - Appearance-based classification makes mistakes (distance, angle, clothing, lighting). It is a
   best-effort filter, not a guarantee.
 - "Married woman" cannot be reliably seen, so it is not attempted.
-- Android v0.1 has no family whitelist yet and classifies one person per frame, so a new person stays
-  blurred for a moment before they can be cleared. Speed depends on the phone.
+- Android: new people stay blurred for roughly a second until the background models clear them.
+  Speed depends on the phone; Settings > Speed and quality has Fast / Balanced / Quality presets.
 - Avatar face / lip-sync overlay and the glasses version are later phases.
