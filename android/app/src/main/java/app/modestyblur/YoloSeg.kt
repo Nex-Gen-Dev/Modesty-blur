@@ -118,7 +118,7 @@ class YoloSeg(ctx: Context, asset: String) {
         cands.sortByDescending { it.score }
         val keep = ArrayList<Cand>()
         for (cd in cands) {
-            if (keep.size >= 8) break
+            if (keep.size >= 40) break          // crowds: never silently leave anyone unblurred
             if (keep.none { iou(it, cd) > 0.5f }) keep.add(cd)
         }
 

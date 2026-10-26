@@ -51,7 +51,9 @@ installs as an update over the previous one. Move to GitHub secrets before shari
 3. CLIP estimates P(female) every few frames (smoothed per person).
 4. A person is un-blurred only if (a) confirmed family by face match (desktop and Android), or
    (b) repeatedly and confidently classified as not female. Any uncertainty keeps the blur on.
-5. If the detector briefly loses a blurred person, the last silhouette keeps blurring for ~10 frames.
+5. Camera motion is measured every frame (a few ms), and every tracked silhouette is shifted with the scene, so
+   blur follows a panning camera and people keep their ID. If the detector briefly loses a blurred person, the
+   shifted silhouette keeps blurring for at most 350 ms, and is dropped as soon as a live detection covers it.
 6. On Android, if a frame fails to process, the screen shows black instead of the raw camera.
 
 ## Run from source (desktop)
@@ -104,11 +106,17 @@ near-instant, and it is the only way to get the miss rate close to zero.
   but they are research-licensed and mostly not from your setting, so use them to bootstrap, not instead of
   your own footage.
 
+**What the classes are.** Only things a camera can see: woman, man, girl (child), boy (child), teen girl,
+teen boy. Women, girls and teen girls are blurred. The model cannot and should not be taught anybody's religion,
+nationality or ethnicity: none of that is visible in a picture, so labels like "Jewish woman" would only teach it
+stereotypes (and would make it worse at the actual job). Anything it should see differently because of clothing
+(a hat, a scarf) is handled by showing it many examples of each visible class wearing those things.
+
 **The workflow** (on your computer, Python installed)
 ```bash
 pip install -r requirements.txt
 python tools/extract_crops.py my_footage/ --out dataset/unlabeled      # 1. cut people out of videos/photos
-python tools/label.py dataset/unlabeled --out dataset                   # 2. sort them: w m g b x (one key each)
+python tools/label.py dataset/unlabeled --out dataset                   # 2. sort them: w m g b t y x (one key each)
 python tools/train_person_cls.py dataset --out models --female-weight 3 # 3. train, see the miss-rate table
 git add models/person_cls.onnx models/person_cls.json && git commit -m "trained classifier" && git push
 ```

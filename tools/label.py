@@ -3,7 +3,8 @@
     python tools/label.py dataset/unlabeled --out dataset
 
 Shows one crop at a time. Keys:
-    w = woman    m = man    g = girl    b = boy
+    w = woman    m = man    g = girl (child)    b = boy (child)
+    t = teen girl    y = teen boy
     x = junk / not a person / cannot tell     s = skip for now
     Backspace = undo the last label           q = quit (progress is kept)
 
@@ -19,7 +20,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-KEYS = {ord("w"): "woman", ord("m"): "man", ord("g"): "girl", ord("b"): "boy", ord("x"): "junk"}
+KEYS = {ord("w"): "woman", ord("m"): "man", ord("g"): "girl", ord("b"): "boy",
+        ord("t"): "teen_girl", ord("y"): "teen_boy", ord("x"): "junk"}
 IMAGE = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
 
@@ -30,7 +32,7 @@ def show(img, counts, name, remaining):
     pad = np.full((view.shape[0] + 70, max(view.shape[1], 640), 3), 30, np.uint8)
     pad[:view.shape[0], :view.shape[1]] = view
     info = "  ".join(f"{k}:{v}" for k, v in counts.items())
-    cv2.putText(pad, "w woman  m man  g girl  b boy  x junk  s skip  <- undo  q quit",
+    cv2.putText(pad, "w woman m man g girl b boy t teen-girl y teen-boy x junk s skip <- undo q quit",
                 (8, view.shape[0] + 24), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
     cv2.putText(pad, f"{info}   left: {remaining}", (8, view.shape[0] + 52),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (120, 220, 120), 1)

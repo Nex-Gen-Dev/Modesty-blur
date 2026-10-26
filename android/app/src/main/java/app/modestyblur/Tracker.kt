@@ -1,14 +1,18 @@
 package app.modestyblur
 
-import kotlin.math.max
-import kotlin.math.min
-
 /**
- * Minimal IoU tracker. A new ID is always blurred until classified, so an ID switch
- * can never leak anyone through; lost tracks stay in the list for a while so the
- * pipeline can keep blurring their last silhouette ("ghosts").
+ * Minimal IoU tracker with camera-motion compensation. A new ID is always blurred until classified, so an
+ * ID switch can never leak anyone through. Lost tracks stay in the list briefly so the pipeline can keep
+ * blurring their (motion-compensated) last silhouette ("ghosts").
+ *
+ * Before matching, every existing track is shifted by the camera motion since the previous frame, so a
+ * person keeps the same ID while you pan the phone.
  */
-class Tracker(private val maxLost: Int = 15, private val minIou: Float = 0.2f) {
+class Tracker(
+    private val maxLost: Int = 30,
+    private val maxLostMs: Long = 1200L,
+    private val minIou: Float = 0.15f,
+) {
     val tracks = ArrayList<Track>()
     private var nextId = 1
 
@@ -17,16 +21,18 @@ class Tracker(private val maxLost: Int = 15, private val minIou: Float = 0.2f) {
         tracks.clear()
     }
 
-    /** Returns the tracks matched to a detection in this frame. */
-    fun update(dets: List<Det>): List<Track> {
-        class Match(val iou: Float, val t: Int, val d: Int)
+    /** Returns the tracks matched to a detection in this frame. [dx],[dy]: scene motion since last frame. */
+    fun update(dets: List<Det>, dx: Int, dy: Int, now: Long): List<Track> {
+        class Match(val score: Float, val t: Int, val d: Int)
+
+        if (dx != 0 || dy != 0) for (t in tracks) t.det = t.det.shifted(dx, dy)
 
         val pairs = ArrayList<Match>()
         for (ti in tracks.indices) for (di in dets.indices) {
-            val v = iou(tracks[ti].det, dets[di])
+            val v = detIou(tracks[ti].det, dets[di])
             if (v >= minIou) pairs.add(Match(v, ti, di))
         }
-        pairs.sortByDescending { it.iou }
+        pairs.sortByDescending { it.score }
 
         val usedT = BooleanArray(tracks.size)
         val usedD = BooleanArray(dets.size)
@@ -36,19 +42,12 @@ class Tracker(private val maxLost: Int = 15, private val minIou: Float = 0.2f) {
             usedD[p.d] = true
             tracks[p.t].det = dets[p.d]
             tracks[p.t].lost = 0
+            tracks[p.t].lastSeenMs = now
         }
         for (ti in tracks.indices) if (!usedT[ti]) tracks[ti].lost++
-        tracks.removeAll { it.lost > maxLost }
+        tracks.removeAll { it.lost > maxLost || now - it.lastSeenMs > maxLostMs }
 
-        for (di in dets.indices) if (!usedD[di]) tracks.add(Track(nextId++, dets[di]))
+        for (di in dets.indices) if (!usedD[di]) tracks.add(Track(nextId++, dets[di]).also { it.lastSeenMs = now })
         return tracks.filter { it.lost == 0 }
-    }
-
-    private fun iou(a: Det, b: Det): Float {
-        val ix = max(0f, min(a.x2, b.x2) - max(a.x1, b.x1))
-        val iy = max(0f, min(a.y2, b.y2) - max(a.y1, b.y1))
-        val inter = ix * iy
-        val ua = (a.x2 - a.x1) * (a.y2 - a.y1) + (b.x2 - b.x1) * (b.y2 - b.y1) - inter
-        return if (ua <= 0f) 0f else inter / ua
     }
 }

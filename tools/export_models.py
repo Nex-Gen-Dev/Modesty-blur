@@ -51,7 +51,10 @@ def export_face_models():
     else:
         raise SystemExit("could not download buffalo_s.zip")
     with zipfile.ZipFile(tmp) as z:
-        for name in ("det_500m.onnx", "w600k_mbf.onnx"):
+        for name in ("det_500m.onnx", "w600k_mbf.onnx", "genderage.onnx"):
+            if name not in z.namelist():
+                print("warning: missing", name, "in buffalo_s.zip")
+                continue
             with z.open(name) as src, open(out / name, "wb") as dst:
                 shutil.copyfileobj(src, dst)
     tmp.unlink()

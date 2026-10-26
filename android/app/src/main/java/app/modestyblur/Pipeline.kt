@@ -57,7 +57,12 @@ class Pipeline(private val ctx: Context) {
     @Volatile var lastReport: List<PersonReport> = emptyList()
         private set
 
-    private val holdFrames = 10
+    private val motion = MotionEstimator()
+    private var appliedX = 0
+    private var appliedY = 0
+    /** How long a person who just vanished from the detector keeps being blurred (following the scene). */
+    private val holdMs = 350L
+    private val maxJobsPerFrame = 3
     private val strength = 0.14f
     val classifierName get() = if (personCls != null) "trained model" else "CLIP zero-shot"
 
@@ -73,6 +78,9 @@ class Pipeline(private val ctx: Context) {
     @Synchronized
     fun reset() {
         tracker.clear()
+        motion.reset()
+        appliedX = 0
+        appliedY = 0
         engine.reset()
         inFlight.clear()
         lastActiveIds = emptyList()
@@ -147,10 +155,19 @@ class Pipeline(private val ctx: Context) {
 
         drainResults(now)
 
+        // 0) how far did the scene move since the last frame? (a few ms; lets blur follow a panning camera)
+        motion.update(bmp)
+        val tx = Math.round(motion.gx)
+        val ty = Math.round(motion.gy)
+        val mdx = tx - appliedX
+        val mdy = ty - appliedY
+        appliedX = tx
+        appliedY = ty
+
         // 1) segmentation + tracking (the only heavy step on the frame path)
         val t0 = System.nanoTime()
         val dilate = (min(W, H) * 0.012f).toInt().coerceAtLeast(6)
-        val active = tracker.update(model.detect(bmp, Prefs.detectConf(ctx), dilate))
+        val active = tracker.update(model.detect(bmp, Prefs.detectConf(ctx), dilate), mdx, mdy, now)
         lastActiveIds = active.map { it.id }
         val t1 = System.nanoTime()
 
@@ -165,9 +182,11 @@ class Pipeline(private val ctx: Context) {
         val alive = HashSet<Int>()
         for (t in tracker.tracks) {
             alive.add(t.id)
-            if (t.lost in 1..holdFrames && engine.shouldBlur(t.id)) {
-                Blur.blurRegion(bmp, t.det.mask, strength)
-            }
+            if (t.lost < 1 || now - t.lastSeenMs > holdMs || !engine.shouldBlur(t.id)) continue
+            // the ghost has been shifted with the scene; skip it if a live detection already covers it
+            if (active.any { detIou(it.det, t.det) > 0.3f }) continue
+            val m = t.det.mask.clippedTo(W, H) ?: continue
+            Blur.blurRegion(bmp, m, strength)
         }
         engine.prune(alive)
         inFlight.keys.retainAll(alive)
@@ -212,15 +231,16 @@ class Pipeline(private val ctx: Context) {
         }
     }
 
-    /** Pick the single most useful background job for this frame. */
+    /** Hand the most useful background jobs (up to [maxJobsPerFrame]) to the worker for this frame. */
     private fun schedule(bmp: Bitmap, active: List<Track>, now: Long) {
-        if (worker.pending() >= 2) return
         val useFace = worker.faceAvailable
+        var started = 0
         // unresolved people first, newest evidence-poor first
         val order = active.sortedWith(
             compareBy<Track>({ !engine.shouldBlur(it.id) }, { engine.state(it.id).nObs > 0 }, { engine.state(it.id).lastClsMs })
         )
         for (t in order) {
+            if (started >= maxJobsPerFrame || worker.pending() >= 4) return
             if (inFlight.containsKey(t.id)) continue
             val s = engine.state(t.id)
             val wantFace = useFace && engine.needsFaceCheck(t.id, now)
@@ -228,17 +248,20 @@ class Pipeline(private val ctx: Context) {
             // the very first look at a new person is the quick face pass (identity + face reading)
             val faceFirst = wantFace && s.faceChecks == 0
             if (faceFirst || (wantFace && !wantCls)) {
-                crop(bmp, t.det, 0.55f)?.let {          // faces live in the upper part of the person
+                val c = crop(bmp, t.det, 0.55f)          // faces live in the upper part of the person
+                if (c != null) {
                     inFlight[t.id] = "face check"
-                    worker.faceCheck(t.id, it, engine.familyThreshold)
-                    return
+                    worker.faceCheck(t.id, c, engine.familyThreshold)
+                    started++
+                    continue
                 }
             }
             if (wantCls) {
-                crop(bmp, t.det, 1f)?.let {
+                val c = crop(bmp, t.det, 1f)
+                if (c != null) {
                     inFlight[t.id] = "classifying ($classifierName)"
-                    worker.classify(t.id, it)
-                    return
+                    worker.classify(t.id, c)
+                    started++
                 }
             }
         }
@@ -306,8 +329,9 @@ class Pipeline(private val ctx: Context) {
         val famCount = FamilyStore.list().size
         val panel = listOf(
             "%.1f fps   frame %.0f ms  (segment %.0f, blur %.0f)".format(fps, totalMs, segMs, blurMs),
-            "people %d   queue %d   classify %d ms   face %d ms".format(
-                active.size, worker.pending(), worker.lastClsMs, worker.lastFaceMs
+            "people %d   queue %d   classify %d ms   face %d ms   motion %+d,%+d px%s".format(
+                active.size, worker.pending(), worker.lastClsMs, worker.lastFaceMs,
+                appliedX, appliedY, if (motion.tooFast) " FAST" else ""
             ),
             "${Presets.names[preset]}  model ${model.inW}x${model.inH}  frame ${bmp.width}x${bmp.height}  classifier: $classifierName",
             "blur if pF>=%.2f  detect>=%.2f  family: %s".format(

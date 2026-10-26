@@ -2,8 +2,10 @@
 
     python tools/train_person_cls.py dataset --out models --epochs 15
 
-Dataset layout (made by tools/label.py):   dataset/woman  dataset/man  dataset/girl  dataset/boy
-Female classes (blurred): woman, girl.  Anything in dataset/junk is ignored.
+Dataset layout (made by tools/label.py):
+    dataset/woman  dataset/man  dataset/girl  dataset/boy  dataset/teen_girl  dataset/teen_boy
+Female classes (blurred): woman, girl, teen_girl.  Anything in dataset/junk is ignored.
+Classes with no pictures are fine (the model just never predicts them).
 
 What you get in --out:
     person_cls.onnx   MobileNetV3-Small, input 1x3x192x96 (RGB 0..1), output = class probabilities
@@ -35,8 +37,8 @@ from torchvision import models, transforms
 
 W, H = 96, 192                       # model input (width, height): tall, like a standing person
 MEAN_RGB = (124, 116, 104)           # padding color (same in the Android app)
-CLASSES = ["woman", "man", "girl", "boy"]
-FEMALE = [0, 2]
+CLASSES = ["woman", "man", "girl", "boy", "teen_girl", "teen_boy"]
+FEMALE = [0, 2, 4]                   # woman, girl, teen_girl are blurred
 IMG = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
 
@@ -195,7 +197,7 @@ def make_smoke_dataset(root: Path):
         for i in range(14):
             h, w = int(rng.integers(80, 220)), int(rng.integers(40, 120))
             base = np.zeros((h, w, 3), np.uint8)
-            base[:] = (ci * 60, 255 - ci * 60, 128)
+            base[:] = (ci * 40, 255 - ci * 40, 128)
             noise = rng.integers(0, 40, (h, w, 3), dtype=np.uint8)
             Image.fromarray(np.clip(base + noise, 0, 255).astype(np.uint8)).save(root / c / f"{i}.jpg")
 
