@@ -86,6 +86,9 @@ jobs:
           path: modesty-blur-android.apk
 
   desktop:
+    # Paused to keep releases fast: desktop builds only run when started by hand
+    # (Actions tab > build-and-release > Run workflow).
+    if: github.event_name == 'workflow_dispatch'
     needs: test
     strategy:
       fail-fast: false
@@ -148,6 +151,7 @@ jobs:
 
   release:
     needs: [android, desktop]
+    if: ${{ !cancelled() && needs.android.result == 'success' && (needs.desktop.result == 'success' || needs.desktop.result == 'skipped') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
