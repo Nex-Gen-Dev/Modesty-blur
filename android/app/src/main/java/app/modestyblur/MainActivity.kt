@@ -9,7 +9,6 @@ import android.os.Bundle
 import android.view.View
 import android.widget.Button
 import android.widget.ImageButton
-import android.widget.ImageView
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
@@ -25,7 +24,7 @@ import java.util.concurrent.Executors
 
 /** Clean full-screen view: just the blurred camera feed. All text lives in Settings / the debug overlay. */
 class MainActivity : AppCompatActivity() {
-    private lateinit var imageView: ImageView
+    private lateinit var imageView: BlurView
     private lateinit var spinner: View
     private lateinit var controls: View
     private lateinit var banner: View
@@ -159,11 +158,9 @@ class MainActivity : AppCompatActivity() {
                     m.postRotate(rot.toFloat())
                     if (lens == CameraSelector.LENS_FACING_FRONT) m.postScale(-1f, 1f)
                     val upright = Bitmap.createBitmap(raw, 0, 0, raw.width, raw.height, m, true)
-                    val out = p.process(upright)
-                    runOnUiThread {
-                        spinner.visibility = View.GONE
-                        imageView.setImageBitmap(out)
-                    }
+                    val out = p.live(upright)          // returns at once; detection runs on its own thread
+                    imageView.show(out)
+                    if (spinner.visibility == View.VISIBLE) runOnUiThread { spinner.visibility = View.GONE }
                 }
             }
             provider.unbindAll()

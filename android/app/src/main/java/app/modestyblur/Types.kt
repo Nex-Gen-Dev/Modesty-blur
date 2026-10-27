@@ -1,10 +1,19 @@
 package app.modestyblur
 
+import android.graphics.Bitmap
 import kotlin.math.max
 import kotlin.math.min
 
+/** GPU-ready copy of a mask; shared by every shifted copy of the same silhouette. */
+class MaskCache {
+    @Volatile var alpha: Bitmap? = null
+}
+
 /** Binary silhouette (0/1 bytes) covering the rectangle [x0, x0+w) x [y0, y0+h) of the frame. */
-class Mask(val x0: Int, val y0: Int, val w: Int, val h: Int, val data: ByteArray)
+class Mask(
+    val x0: Int, val y0: Int, val w: Int, val h: Int, val data: ByteArray,
+    val cache: MaskCache = MaskCache(),
+)
 
 class Det(
     val x1: Float, val y1: Float, val x2: Float, val y2: Float,
@@ -15,12 +24,15 @@ class Track(val id: Int, var det: Det) {
     var lost: Int = 0
     /** Wall-clock time (ms) of the last frame this person was actually detected. */
     var lastSeenMs: Long = 0L
+    /** Walking speed of the person in the scene, pixels per millisecond (camera motion removed). */
+    var vx: Float = 0f
+    var vy: Float = 0f
 }
 
 /** The same detection moved by (dx, dy) pixels: used to follow the scene when the camera pans. */
 fun Det.shifted(dx: Int, dy: Int): Det =
     if (dx == 0 && dy == 0) this
-    else Det(x1 + dx, y1 + dy, x2 + dx, y2 + dy, score, Mask(mask.x0 + dx, mask.y0 + dy, mask.w, mask.h, mask.data))
+    else Det(x1 + dx, y1 + dy, x2 + dx, y2 + dy, score, Mask(mask.x0 + dx, mask.y0 + dy, mask.w, mask.h, mask.data, mask.cache))
 
 fun detIou(a: Det, b: Det): Float {
     val ix = max(0f, min(a.x2, b.x2) - max(a.x1, b.x1))

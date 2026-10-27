@@ -21,6 +21,12 @@ class Tracker(
         tracks.clear()
     }
 
+    /** Move every track with the scene (camera panned by dx, dy pixels). */
+    fun shift(dx: Int, dy: Int) {
+        if (dx == 0 && dy == 0) return
+        for (t in tracks) t.det = t.det.shifted(dx, dy)
+    }
+
     /** Returns the tracks matched to a detection in this frame. [dx],[dy]: scene motion since last frame. */
     fun update(dets: List<Det>, dx: Int, dy: Int, now: Long): List<Track> {
         class Match(val score: Float, val t: Int, val d: Int)
@@ -40,9 +46,18 @@ class Tracker(
             if (usedT[p.t] || usedD[p.d]) continue
             usedT[p.t] = true
             usedD[p.d] = true
-            tracks[p.t].det = dets[p.d]
-            tracks[p.t].lost = 0
-            tracks[p.t].lastSeenMs = now
+            val tr = tracks[p.t]
+            val nd = dets[p.d]
+            val dtMs = now - tr.lastSeenMs
+            if (dtMs in 1..600) {
+                val vx = ((nd.x1 + nd.x2) - (tr.det.x1 + tr.det.x2)) / 2f / dtMs
+                val vy = ((nd.y1 + nd.y2) - (tr.det.y1 + tr.det.y2)) / 2f / dtMs
+                tr.vx = (0.5f * tr.vx + 0.5f * vx).coerceIn(-1.5f, 1.5f)
+                tr.vy = (0.5f * tr.vy + 0.5f * vy).coerceIn(-1.5f, 1.5f)
+            }
+            tr.det = nd
+            tr.lost = 0
+            tr.lastSeenMs = now
         }
         for (ti in tracks.indices) if (!usedT[ti]) tracks[ti].lost++
         tracks.removeAll { it.lost > maxLost || now - it.lastSeenMs > maxLostMs }

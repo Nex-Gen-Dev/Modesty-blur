@@ -134,7 +134,7 @@ object Blur {
     }
 
     /** Three passes of zero-padded box blur (approximates a Gaussian). */
-    private fun boxBlur3(a: FloatArray, w: Int, h: Int, r: Int) {
+    fun boxBlur3(a: FloatArray, w: Int, h: Int, r: Int) {
         val tmp = FloatArray(a.size)
         repeat(3) {
             boxPassH(a, tmp, w, h, r)

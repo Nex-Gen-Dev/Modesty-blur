@@ -34,12 +34,16 @@ class YoloSeg(ctx: Context, asset: String) {
     private val inputName: String
     val inH: Int
     val inW: Int
+    /** Which runtime won the speed test on this phone ("CPU", "XNNPACK" or "NNAPI") and its time. */
+    val accel: String
+    val accelMs: Float
 
     init {
         val bytes = ctx.assets.open(asset).use { it.readBytes() }
-        val opts = OrtSession.SessionOptions()
-        opts.setIntraOpNumThreads(4)
-        session = env.createSession(bytes, opts)
+        val r = Accel.open(ctx, env, asset, bytes)
+        session = r.session
+        accel = r.name
+        accelMs = r.ms
         inputName = session.inputNames.first()
         val shape = (session.inputInfo[inputName]!!.info as TensorInfo).shape   // [1, 3, H, W]
         inH = shape[2].toInt()

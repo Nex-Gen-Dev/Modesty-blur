@@ -23,6 +23,7 @@ Self-test with fake data (used by CI):  python tools/train_person_cls.py --smoke
 
 import argparse
 import json
+import multiprocessing as mp
 import random
 import sys
 import tempfile
@@ -103,6 +104,41 @@ def collect(root: Path):
         if d.exists():
             items += [(p, ci) for p in sorted(d.iterdir()) if p.suffix.lower() in IMG]
     return items
+
+
+def _shrink_one(args):
+    src, dst = args
+    try:
+        if Path(dst).exists():
+            return 1
+        im = pad_to_aspect(Image.open(src).convert("RGB"))
+        im.save(dst, quality=92)
+        return 1
+    except Exception:
+        return 0
+
+
+def shrink_dataset(root: Path, dst: Path, workers: int):
+    """Pre-shrink every picture to the model's input size ONCE (fast to re-read for every epoch).
+    Needed for big sets: decoding 200,000 full-size photos every epoch would take hours."""
+    jobs = []
+    for c in CLASSES:
+        d = root / c
+        if not d.exists():
+            continue
+        (dst / c).mkdir(parents=True, exist_ok=True)
+        for i, p in enumerate(sorted(d.rglob("*"))):
+            if p.suffix.lower() in IMG:
+                jobs.append((str(p), str(dst / c / f"{i:07d}.jpg")))
+    print(f"shrinking {len(jobs)} pictures with {workers} processes ...")
+    ok = 0
+    with mp.Pool(workers) as pool:
+        for n, r in enumerate(pool.imap_unordered(_shrink_one, jobs, chunksize=64), 1):
+            ok += r
+            if n % 5000 == 0:
+                print(f"  {n}/{len(jobs)}")
+    print(f"shrunk {ok} pictures ({len(jobs) - ok} unreadable skipped)")
+    return dst
 
 
 def split(items, val_frac=0.15, seed=0):
@@ -211,6 +247,10 @@ def main():
     ap.add_argument("--lr", type=float, default=5e-4)
     ap.add_argument("--female-weight", type=float, default=2.0,
                     help="how much more a missed woman/girl costs than a falsely blurred man/boy")
+    ap.add_argument("--workers", type=int, default=4, help="parallel image-loading processes")
+    ap.add_argument("--shrink", default=None, metavar="DIR",
+                    help="first shrink all pictures into DIR (recommended for big sets), then train from there")
+    ap.add_argument("--no-balance", action="store_true", help="do not re-weight rare classes")
     ap.add_argument("--smoke", action="store_true", help="tiny fake-data run to check the code works")
     a = ap.parse_args()
 
@@ -226,6 +266,8 @@ def main():
         root, out = Path(a.dataset), Path(a.out)
         pretrained = True
 
+    if a.shrink and not a.smoke:
+        root = shrink_dataset(root, Path(a.shrink), max(1, a.workers))
     items = collect(root)
     if len(items) < 8:
         sys.exit(f"Found only {len(items)} labeled crops in {root}. Label more with tools/label.py first.")
@@ -233,14 +275,25 @@ def main():
     print("labeled crops:", counts)
     tr_items, va_items = split(items)
     train_tf, plain_tf = build_transforms()
-    tr = torch.utils.data.DataLoader(Crops(tr_items, train_tf), batch_size=a.batch, shuffle=True, num_workers=0)
-    va = torch.utils.data.DataLoader(Crops(va_items, plain_tf), batch_size=a.batch) if va_items else None
+    nw = 0 if a.smoke else max(0, a.workers)
+    kw = dict(num_workers=nw, pin_memory=torch.cuda.is_available(), persistent_workers=nw > 0)
+    tr = torch.utils.data.DataLoader(Crops(tr_items, train_tf), batch_size=a.batch, shuffle=True, drop_last=len(tr_items) > a.batch, **kw)
+    va = torch.utils.data.DataLoader(Crops(va_items, plain_tf), batch_size=a.batch, **kw) if va_items else None
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    use_amp = device == "cuda"
     net = make_net(pretrained).to(device)
+    if use_amp:
+        net = net.to(memory_format=torch.channels_last)
     w = torch.ones(len(CLASSES))
+    if not a.no_balance:
+        cnt = torch.tensor([max(counts[c], 1) for c in CLASSES], dtype=torch.float)
+        have = torch.tensor([counts[c] > 0 for c in CLASSES])
+        mean_cnt = cnt[have].mean()
+        w = torch.where(have, (mean_cnt / cnt).clamp(0.25, 4.0).sqrt(), torch.ones(len(CLASSES)))
     for i in FEMALE:
-        w[i] = a.female_weight
+        w[i] *= a.female_weight
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
     loss_fn = nn.CrossEntropyLoss(weight=w.to(device), label_smoothing=0.05)
     opt = torch.optim.AdamW(net.parameters(), lr=a.lr, weight_decay=1e-4)
     sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=a.lr, total_steps=max(1, a.epochs * len(tr)))
@@ -250,11 +303,13 @@ def main():
         net.train()
         total = 0.0
         for x, y in tr:
-            x, y = x.to(device), y.to(device)
-            opt.zero_grad()
-            loss = loss_fn(net((x - MEAN.to(device)) / STD.to(device)), y)
-            loss.backward()
-            opt.step()
+            x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+            opt.zero_grad(set_to_none=True)
+            with torch.autocast(device_type=device, dtype=torch.float16, enabled=use_amp):
+                loss = loss_fn(net((x - MEAN.to(device)) / STD.to(device)), y)
+            scaler.scale(loss).backward()
+            scaler.step(opt)
+            scaler.update()
             sched.step()
             total += loss.item() * len(y)
         msg = f"epoch {ep + 1}/{a.epochs}  train loss {total / len(tr_items):.3f}"

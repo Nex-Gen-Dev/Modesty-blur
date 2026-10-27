@@ -112,6 +112,11 @@ nationality or ethnicity: none of that is visible in a picture, so labels like "
 stereotypes (and would make it worse at the actual job). Anything it should see differently because of clothing
 (a hat, a scarf) is handled by showing it many examples of each visible class wearing those things.
 
+**Big datasets (tens of thousands of pictures): use Google Colab.** Put the pictures in your Google Drive
+(one folder per class, or zip files per class) and open
+[the training notebook](https://colab.research.google.com/github/Nex-Gen-Dev/Modesty-blur/blob/main/tools/train_colab.ipynb).
+It trains on a free GPU, saves `person_cls.onnx` + `person_cls.json` to your Drive, and you commit them to `models/`.
+
 **The workflow** (on your computer, Python installed)
 ```bash
 pip install -r requirements.txt

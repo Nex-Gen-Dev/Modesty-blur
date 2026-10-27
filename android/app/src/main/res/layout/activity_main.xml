@@ -4,11 +4,10 @@
     android:layout_height="match_parent"
     android:background="#000000">
 
-    <ImageView
+    <app.modestyblur.BlurView
         android:id="@+id/view"
         android:layout_width="match_parent"
-        android:layout_height="match_parent"
-        android:scaleType="fitCenter" />
+        android:layout_height="match_parent" />
 
     <ProgressBar
         android:id="@+id/spinner"

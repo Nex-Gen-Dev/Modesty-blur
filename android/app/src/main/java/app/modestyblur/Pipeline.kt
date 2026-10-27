@@ -7,8 +7,10 @@ import android.graphics.Color
 import android.graphics.Paint
 import android.os.SystemClock
 import android.util.Log
+import java.util.concurrent.Executors
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.roundToInt
 
 /** What the app decided about one person (used by the Test lab). */
 class PersonReport(
@@ -29,9 +31,15 @@ object PipelineHolder {
 }
 
 /**
- * Per frame (fast, on the camera thread): segment -> track -> blur.
- * In the background (never blocks the view): the person classifier and face matching.
- * Fail-closed: anyone not yet cleared by the background models is blurred.
+ * Two ways to run, sharing the same tracker and decision engine:
+ *
+ *  - [live] (camera screen): the screen is drawn at camera speed. Detection runs on its own thread every
+ *    ~100 ms; between detections each blur follows the camera's motion and the person's walking speed.
+ *    The blur itself is drawn by the GPU (see [BlurView]).
+ *  - [process] / [runStill] (Test lab): detect, then blur on the CPU, one photo at a time.
+ *
+ * Classification and face matching always run on a background worker. Fail-closed: anyone not yet cleared by
+ * the background models is blurred, and any error shows a black screen instead of the camera.
  */
 class Pipeline(private val ctx: Context) {
     private val personCls: PersonClassifier? = PersonClassifier.create(ctx)
@@ -42,7 +50,8 @@ class Pipeline(private val ctx: Context) {
     private val engine = DecisionEngine()
     private val inFlight = HashMap<Int, String>()
 
-    private var yolo: YoloSeg? = null
+    private val modelLock = Any()
+    @Volatile private var yolo: YoloSeg? = null
     private var preset = -1
     private var frame = 0
     private var fps = 0f
@@ -51,6 +60,13 @@ class Pipeline(private val ctx: Context) {
     private var blurMs = 0f
     private var totalMs = 0f
     private var lastActiveIds: List<Int> = emptyList()
+
+    // live-mode state
+    private val detExec = Executors.newSingleThreadExecutor()
+    @Volatile private var detBusy = false
+    private var detMs = 0f
+    private var detGapMs = 0f
+    private var lastDetEnd = 0L
 
     /** The Test lab turns this on so the labels are always drawn. */
     @Volatile var forceDebug = false
@@ -62,17 +78,24 @@ class Pipeline(private val ctx: Context) {
     private var appliedY = 0
     /** How long a person who just vanished from the detector keeps being blurred (following the scene). */
     private val holdMs = 350L
+    private val liveHoldMs = 500L
     private val maxJobsPerFrame = 3
     private val strength = 0.14f
     val classifierName get() = if (personCls != null) "trained model" else "CLIP zero-shot"
 
-    private val text = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.WHITE }
-    private val shadow = Paint().apply { color = Color.argb(150, 0, 0, 0); style = Paint.Style.FILL }
-    private val box = Paint().apply { style = Paint.Style.STROKE }
-
     init {
         FamilyStore.load(ctx)
         engine.steadyClassifyMs = if (personCls != null) 500L else 3000L
+    }
+
+    private fun ensureModel(): YoloSeg = synchronized(modelLock) {
+        val p = Prefs.preset(ctx)
+        if (p != preset || yolo == null) {
+            yolo?.close()
+            yolo = YoloSeg(ctx, Presets.yoloAsset(p))
+            preset = p
+        }
+        yolo!!
     }
 
     @Synchronized
@@ -87,6 +110,140 @@ class Pipeline(private val ctx: Context) {
         lastReport = emptyList()
     }
 
+    // =============================================================================================
+    //  LIVE PATH (camera screen)
+    // =============================================================================================
+
+    private class Pending(val bmp: Bitmap, val capX: Int, val capY: Int, val capMs: Long)
+
+    /** Returns immediately with what to draw for this camera frame. Never waits for detection. */
+    fun live(src: Bitmap): LiveFrame {
+        return try {
+            liveInner(src)
+        } catch (e: Throwable) {
+            Log.e("Pipeline", "live frame failed", e)
+            LiveFrame(null, emptyList(), null)          // fail closed: black screen
+        }
+    }
+
+    private fun liveInner(src: Bitmap): LiveFrame {
+        val tStart = System.nanoTime()
+        val now = SystemClock.elapsedRealtime()
+        val W = src.width
+        val H = src.height
+
+        // frame shrunk to 1/6: the colours for the blur come from here
+        val tw = max(8, W / LiveRender.CELL)
+        val th = max(8, H / LiveRender.CELL)
+        val small = Bitmap.createScaledBitmap(src, tw, th, true)
+        val thumb = IntArray(tw * th)
+        small.getPixels(thumb, 0, tw, 0, 0, tw, th)
+        if (small !== src) small.recycle()
+        val cw = W.toFloat() / tw
+        val ch = H.toFloat() / th
+
+        motion.update(src)
+        val debug = Prefs.debug(ctx)
+        val sprites = ArrayList<Sprite>()
+        var info: DebugInfo? = null
+
+        synchronized(this) {
+            engine.blurThreshold = Prefs.blurThreshold(ctx)
+            engine.familyThreshold = Prefs.familyThreshold(ctx)
+
+            val tx = Math.round(motion.gx)
+            val ty = Math.round(motion.gy)
+            val mdx = tx - appliedX
+            val mdy = ty - appliedY
+            appliedX = tx
+            appliedY = ty
+            tracker.shift(mdx, mdy)                 // everyone moves with the scene
+
+            drainResults(now)
+
+            if (!detBusy) {
+                detBusy = true
+                val job = Pending(src, appliedX, appliedY, now)
+                detExec.execute {
+                    try {
+                        detect(job)
+                    } catch (e: Throwable) {
+                        Log.e("Pipeline", "detection failed", e)
+                    } finally {
+                        detBusy = false
+                    }
+                }
+            }
+
+            val active = tracker.tracks.filter { it.lost == 0 }
+            for (t in tracker.tracks) {
+                if (!engine.shouldBlur(t.id)) continue
+                if (t.lost >= 1) {
+                    if (now - t.lastSeenMs > liveHoldMs) continue
+                    if (active.any { detIou(it.det, t.det) > 0.3f }) continue
+                }
+                val d = predicted(t, now)
+                LiveRender.sprite(d.mask, thumb, tw, th, cw, ch, strength)?.let { sprites.add(it) }
+            }
+
+            frame++
+            val total = (System.nanoTime() - tStart) / 1e6f
+            totalMs = smooth(totalMs, total)
+            val inst = 1e9f / (tStart - lastStart).coerceAtLeast(1)
+            fps = if (fps == 0f) inst else 0.9f * fps + 0.1f * inst
+            lastStart = tStart
+
+            if (debug) info = buildDebug(active, yolo, true)
+        }
+        return LiveFrame(src, sprites, info)
+    }
+
+    /** Where the person probably is right now: last detection plus walking speed times the time since. */
+    private fun predicted(t: Track, now: Long): Det {
+        val dt = (now - t.lastSeenMs).coerceIn(0L, 300L)
+        if (dt == 0L || (t.vx == 0f && t.vy == 0f)) return t.det
+        val bw = t.det.x2 - t.det.x1
+        val bh = t.det.y2 - t.det.y1
+        val ox = (t.vx * dt).coerceIn(-0.2f * bw, 0.2f * bw).roundToInt()
+        val oy = (t.vy * dt).coerceIn(-0.2f * bh, 0.2f * bh).roundToInt()
+        return t.det.shifted(ox, oy)
+    }
+
+    /** Runs on the detection thread. */
+    private fun detect(job: Pending) {
+        val model = ensureModel()
+        val W = job.bmp.width
+        val H = job.bmp.height
+        val dilate = (min(W, H) * 0.012f).toInt().coerceAtLeast(6)
+        val t0 = System.nanoTime()
+        val dets = model.detect(job.bmp, Prefs.detectConf(ctx), dilate)
+        val ms = (System.nanoTime() - t0) / 1e6f
+        val end = SystemClock.elapsedRealtime()
+
+        synchronized(this) {
+            // the camera may have moved since this frame was captured: bring the result up to date
+            val dx = appliedX - job.capX
+            val dy = appliedY - job.capY
+            val moved = if (dx != 0 || dy != 0) dets.map { it.shifted(dx, dy) } else dets
+            val active = tracker.update(moved, 0, 0, job.capMs)
+            lastActiveIds = active.map { it.id }
+            schedule(job.bmp, active, end, dx, dy)
+
+            val alive = HashSet<Int>()
+            for (t in tracker.tracks) alive.add(t.id)
+            engine.prune(alive)
+            inFlight.keys.retainAll(alive)
+
+            detMs = smooth(detMs, ms)
+            if (lastDetEnd != 0L) detGapMs = smooth(detGapMs, (end - lastDetEnd).toFloat())
+            lastDetEnd = end
+        }
+    }
+
+    // =============================================================================================
+    //  BLOCKING PATH (Test lab)
+    // =============================================================================================
+
     @Synchronized
     fun process(src: Bitmap): Bitmap {
         return try {
@@ -98,8 +255,8 @@ class Pipeline(private val ctx: Context) {
                 val c = Canvas(it)
                 c.drawColor(Color.BLACK)
                 if (Prefs.debug(ctx) || forceDebug) {
-                    text.textSize = src.width * 0.03f
-                    c.drawText("error: " + (e.message ?: e.javaClass.simpleName), 20f, 60f, text)
+                    val p = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.WHITE; textSize = src.width * 0.03f }
+                    c.drawText("error: " + (e.message ?: e.javaClass.simpleName), 20f, 60f, p)
                 }
             }
         }
@@ -138,13 +295,7 @@ class Pipeline(private val ctx: Context) {
         val tStart = System.nanoTime()
         val now = SystemClock.elapsedRealtime()
 
-        val p = Prefs.preset(ctx)
-        if (p != preset || yolo == null) {
-            yolo?.close()
-            yolo = YoloSeg(ctx, Presets.yoloAsset(p))
-            preset = p
-        }
-        val model = yolo!!
+        val model = ensureModel()
         engine.blurThreshold = Prefs.blurThreshold(ctx)
         engine.familyThreshold = Prefs.familyThreshold(ctx)
         val debug = Prefs.debug(ctx) || forceDebug
@@ -155,7 +306,6 @@ class Pipeline(private val ctx: Context) {
 
         drainResults(now)
 
-        // 0) how far did the scene move since the last frame? (a few ms; lets blur follow a panning camera)
         motion.update(bmp)
         val tx = Math.round(motion.gx)
         val ty = Math.round(motion.gy)
@@ -164,26 +314,21 @@ class Pipeline(private val ctx: Context) {
         appliedX = tx
         appliedY = ty
 
-        // 1) segmentation + tracking (the only heavy step on the frame path)
         val t0 = System.nanoTime()
         val dilate = (min(W, H) * 0.012f).toInt().coerceAtLeast(6)
         val active = tracker.update(model.detect(bmp, Prefs.detectConf(ctx), dilate), mdx, mdy, now)
         lastActiveIds = active.map { it.id }
         val t1 = System.nanoTime()
 
-        // 2) hand at most one job per frame to the background worker (crops come from the clean frame)
-        schedule(bmp, active, now)
+        schedule(bmp, active, now, 0, 0)
 
-        // 3) blur everyone not cleared
         for (t in active) {
             if (engine.shouldBlur(t.id)) Blur.blurRegion(bmp, t.det.mask, strength)
         }
-        // keep blurring recently lost blurred tracks so detector dropouts never flash someone through
         val alive = HashSet<Int>()
         for (t in tracker.tracks) {
             alive.add(t.id)
             if (t.lost < 1 || now - t.lastSeenMs > holdMs || !engine.shouldBlur(t.id)) continue
-            // the ghost has been shifted with the scene; skip it if a live detection already covers it
             if (active.any { detIou(it.det, t.det) > 0.3f }) continue
             val m = t.det.mask.clippedTo(W, H) ?: continue
             Blur.blurRegion(bmp, m, strength)
@@ -206,9 +351,13 @@ class Pipeline(private val ctx: Context) {
         fps = if (fps == 0f) inst else 0.9f * fps + 0.1f * inst
         lastStart = tStart
 
-        if (debug) drawDebug(bmp, active, model)
+        if (debug) buildDebug(active, model, false).draw(Canvas(bmp), W)
         return bmp
     }
+
+    // =============================================================================================
+    //  shared
+    // =============================================================================================
 
     private fun smooth(old: Float, v: Float) = if (old == 0f) v else 0.9f * old + 0.1f * v
 
@@ -231,8 +380,11 @@ class Pipeline(private val ctx: Context) {
         }
     }
 
-    /** Hand the most useful background jobs (up to [maxJobsPerFrame]) to the worker for this frame. */
-    private fun schedule(bmp: Bitmap, active: List<Track>, now: Long) {
+    /**
+     * Hand the most useful background jobs (up to [maxJobsPerFrame]) to the worker. [ox],[oy]: how far the
+     * tracks have moved since [bmp] was captured, so crops are cut from the right place in that image.
+     */
+    private fun schedule(bmp: Bitmap, active: List<Track>, now: Long, ox: Int, oy: Int) {
         val useFace = worker.faceAvailable
         var started = 0
         // unresolved people first, newest evidence-poor first
@@ -248,7 +400,7 @@ class Pipeline(private val ctx: Context) {
             // the very first look at a new person is the quick face pass (identity + face reading)
             val faceFirst = wantFace && s.faceChecks == 0
             if (faceFirst || (wantFace && !wantCls)) {
-                val c = crop(bmp, t.det, 0.55f)          // faces live in the upper part of the person
+                val c = crop(bmp, t.det, 0.55f, ox, oy)          // faces live in the upper part of the person
                 if (c != null) {
                     inFlight[t.id] = "face check"
                     worker.faceCheck(t.id, c, engine.familyThreshold)
@@ -257,7 +409,7 @@ class Pipeline(private val ctx: Context) {
                 }
             }
             if (wantCls) {
-                val c = crop(bmp, t.det, 1f)
+                val c = crop(bmp, t.det, 1f, ox, oy)
                 if (c != null) {
                     inFlight[t.id] = "classifying ($classifierName)"
                     worker.classify(t.id, c)
@@ -267,13 +419,16 @@ class Pipeline(private val ctx: Context) {
         }
     }
 
-    private fun crop(src: Bitmap, d: Det, heightFraction: Float): Bitmap? {
+    private fun crop(src: Bitmap, d: Det, heightFraction: Float, ox: Int, oy: Int): Bitmap? {
         val pw = ((d.x2 - d.x1) * 0.05f).toInt()
         val ph = ((d.y2 - d.y1) * 0.05f).toInt()
-        val x1 = (d.x1.toInt() - pw).coerceIn(0, src.width - 1)
-        val y1 = (d.y1.toInt() - ph).coerceIn(0, src.height - 1)
-        val x2 = (d.x2.toInt() + pw).coerceIn(x1 + 1, src.width)
-        val yEnd = d.y1 + (d.y2 - d.y1) * heightFraction
+        val bx1 = d.x1.toInt() - ox
+        val by1 = d.y1.toInt() - oy
+        val bx2 = d.x2.toInt() - ox
+        val x1 = (bx1 - pw).coerceIn(0, src.width - 1)
+        val y1 = (by1 - ph).coerceIn(0, src.height - 1)
+        val x2 = (bx2 + pw).coerceIn(x1 + 1, src.width)
+        val yEnd = (d.y1 - oy) + (d.y2 - d.y1) * heightFraction
         val y2 = (yEnd.toInt() + ph).coerceIn(y1 + 1, src.height)
         if (x2 - x1 < 12 || y2 - y1 < 12) return null
         return Bitmap.createBitmap(src, x1, y1, x2 - x1, y2 - y1)
@@ -289,13 +444,8 @@ class Pipeline(private val ctx: Context) {
         else -> "BLUR (unsure)"
     }
 
-    private fun drawDebug(bmp: Bitmap, active: List<Track>, model: YoloSeg) {
-        val c = Canvas(bmp)
-        val ts = max(bmp.width * 0.024f, 14f)
-        text.textSize = ts
-        box.strokeWidth = max(2f, ts / 8f)
-
-        for (t in active) {
+    private fun buildDebug(active: List<Track>, model: YoloSeg?, live: Boolean): DebugInfo {
+        val items = active.map { t ->
             val s = engine.state(t.id)
             val color = when {
                 s.isFamily -> Color.CYAN
@@ -304,45 +454,39 @@ class Pipeline(private val ctx: Context) {
                 else -> Color.RED
             }
             val action = inFlight[t.id] ?: "idle"
-            val l1 = "#${t.id} ${statusLabel(s)}"
-            val l2 = "pF=%.2f  n=%d  %s".format(s.ema, s.nObs, action)
-            val l3 = if (s.faceChecks > 0) {
+            val lines = ArrayList<String>()
+            lines.add("#${t.id} ${statusLabel(s)}")
+            lines.add("pF=%.2f  n=%d  %s".format(s.ema, s.nObs, action))
+            if (s.faceChecks > 0) {
                 val g = if (s.facePFemale >= 0f) "face F=%.2f".format(s.facePFemale) else "no face"
-                "$g  sim=%.2f  hits=%d".format(s.lastSim, s.familyHits)
-            } else ""
-
-            box.color = color
-            c.drawRect(t.det.x1, t.det.y1, t.det.x2, t.det.y2, box)
-
-            val lines = if (l3.isEmpty()) listOf(l1, l2) else listOf(l1, l2, l3)
-            val bw = lines.maxOf { text.measureText(it) } + ts * 0.6f
-            val bh = ts * 1.25f * lines.size + ts * 0.3f
-            val bx = t.det.x1.coerceIn(0f, max(0f, bmp.width - bw))
-            val by = (t.det.y1 - bh).let { if (it < 0f) t.det.y1 else it }
-            c.drawRect(bx, by, bx + bw, by + bh, shadow)
-            text.color = color
-            for ((i, line) in lines.withIndex()) {
-                c.drawText(line, bx + ts * 0.3f, by + ts * (1.25f * (i + 1)), text)
+                lines.add("$g  sim=%.2f  hits=%d".format(s.lastSim, s.familyHits))
             }
+            DebugItem(t.det.x1, t.det.y1, t.det.x2, t.det.y2, color, lines)
         }
 
         val famCount = FamilyStore.list().size
-        val panel = listOf(
-            "%.1f fps   frame %.0f ms  (segment %.0f, blur %.0f)".format(fps, totalMs, segMs, blurMs),
+        val panel = ArrayList<String>()
+        if (live) {
+            panel.add("%.0f fps screen   detect %.0f ms every %.0f ms   frame %.1f ms".format(fps, detMs, detGapMs, totalMs))
+        } else {
+            panel.add("%.1f fps   frame %.0f ms  (segment %.0f, blur %.0f)".format(fps, totalMs, segMs, blurMs))
+        }
+        panel.add(
             "people %d   queue %d   classify %d ms   face %d ms   motion %+d,%+d px%s".format(
                 active.size, worker.pending(), worker.lastClsMs, worker.lastFaceMs,
                 appliedX, appliedY, if (motion.tooFast) " FAST" else ""
-            ),
-            "${Presets.names[preset]}  model ${model.inW}x${model.inH}  frame ${bmp.width}x${bmp.height}  classifier: $classifierName",
+            )
+        )
+        val presetName = if (preset in Presets.names.indices) Presets.names[preset] else "?"
+        panel.add(
+            "$presetName  model ${model?.inW}x${model?.inH}  runs on ${model?.accel} (${"%.0f".format(model?.accelMs ?: 0f)} ms test)  classifier: $classifierName"
+        )
+        panel.add(
             "blur if pF>=%.2f  detect>=%.2f  family: %s".format(
                 engine.blurThreshold, Prefs.detectConf(ctx),
                 if (!worker.faceAvailable) "face models missing" else if (famCount == 0) "nobody enrolled" else "$famCount enrolled"
-            ),
+            )
         )
-        val pw = panel.maxOf { text.measureText(it) } + ts * 0.8f
-        val ph = ts * 1.25f * panel.size + ts * 0.4f
-        c.drawRect(0f, 0f, pw, ph, shadow)
-        text.color = Color.WHITE
-        for ((i, line) in panel.withIndex()) c.drawText(line, ts * 0.4f, ts * 1.25f * (i + 1), text)
+        return DebugInfo(items, panel)
     }
 }
