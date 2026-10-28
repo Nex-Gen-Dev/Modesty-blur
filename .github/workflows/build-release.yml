@@ -6,6 +6,9 @@ name: build-and-release
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - "**.md"
+      - "tools/*.ipynb"
   workflow_dispatch:
 
 permissions:
