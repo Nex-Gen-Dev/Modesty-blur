@@ -178,7 +178,7 @@ def evaluate(net, loader, device):
     net.eval()
     probs, ys = [], []
     for x, y in loader:
-        p = F.softmax(net(((x.to(device) - MEAN) / STD)), dim=1).cpu()
+        p = F.softmax(net(((x.to(device) - MEAN.to(device)) / STD.to(device))), dim=1).cpu()
         probs.append(p)
         ys.append(y)
     return torch.cat(probs), torch.cat(ys)
